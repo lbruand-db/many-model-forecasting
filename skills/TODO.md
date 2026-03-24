@@ -44,3 +44,11 @@ df, *_ = M4.load("data", group="Daily")
 - **M4 Daily** — small, fast, already in MMF schema
 - **samples.nyctaxi.trips** — zero setup on Databricks
 - **Favorita** or **M5** — realistic stress tests
+
+ * [ ] prefilter model (for optimizing cost) 
+ * [ ] genie code
+ * [ ] GEPA testing
+ * [ ] driver memory limit ( can we do something about ? )
+ * [ ] overfitting detection with the skill or testset spill
+ * [ ] more realistic data ?
+ * [ ] data preparation improvement
