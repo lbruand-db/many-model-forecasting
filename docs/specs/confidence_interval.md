@@ -721,9 +721,10 @@ intervals. Users then see the trade-off on their own data before switching.
 #### 7.6.4 Experiment: choosing the options on M5
 
 Notebook: `docs/specs/experiments/pi_grouping_m5.py`. Raw results (232 rows, from the
-confirmation run): `docs/specs/experiments/pi_grouping_m5_results.json`. It ran on
-serverless in the `fe-sandbox-air-eu-test` workspace (runs `878662839893805` and
-`324298550294595`), taking about 20 min each.
+confirmation run): `docs/specs/experiments/pi_grouping_m5_results.json`, plus
+`pi_grouping_m5_results_seed42.json` for the second seed. It ran on serverless in the
+`fe-sandbox-air-eu-test` workspace (runs `878662839893805`, `324298550294595` and
+`458608515774101`), taking about 20 min each.
 
 **Setup**
 
@@ -785,6 +786,26 @@ toward ABC×XYZ and a κ sweep:
   under-cover visibly at 95% (0.930–0.943). → **default `shrinkage_kappa: 10`**. Use 20
   when coverage matters more than width.
 
+**Second seed** (run `458608515774101`, seed 42). This run used 4,955 different
+series with the same mix: 75% intermittent, 13% lumpy, 9% smooth, 3% erratic, and
+32/32/35% A/B/C. Every conclusion holds:
+
+| Check | Seed 7 | Seed 42 |
+|---|---|---|
+| ABC×XYZ is the best grouping | 12/12 | 12/12 |
+| Series shrinkage beats the best grouping (MSIS) | 12/12 | 12/12 |
+| ABC×XYZ shrinkage beats SB shrinkage (MSIS) | 48/48 | 47/48 ¹ |
+| κ=5 / 10 / 20 / 40: mean coverage gap | −1.8 / −1.3 / −1.1 / −1.1 pt | −1.6 / −1.1 / −1.0 / −1.0 pt |
+| κ=5 / 10 / 40: MSIS vs κ=20 | −6.2 / −3.8 / +4.2% | −8.3 / −4.9 / +5.3% |
+| AutoETS 95%, W=3, MSIS: marginal / ABC×XYZ / default / native | 17.4 / 16.1 / 13.9 / 9.9 | 17.7 / 16.6 / 13.9 / 10.4 |
+| AutoETS 95%, W=3, Nixtla-style coverage | 0.700 | 0.707 |
+
+¹ The one loss is CrostonSBA at 80% with W=3 and κ=5: 6.882 vs 6.878, a tie.
+
+Across the 232 matching rows, coverage differs between the seeds by 0.2 points on
+average, and by at most 1.0 point. The 1–7% MSIS gaps between groupings are therefore
+larger than the seed-to-seed noise.
+
 **Findings**
 
 1. **Grouping column:** ABC×XYZ ranked first among all groupings in every one of the 12
@@ -814,12 +835,10 @@ toward ABC×XYZ and a κ sweep:
 
 **Caveats and follow-ups**
 
-- One dataset (mostly intermittent), one test period, one seed, local models only. No
-  global or foundation models were tested.
-- There are no error bars on the metrics. The small gaps between groupings (1–7%)
-  need a second seed or a bootstrap over series to confirm.
-- κ was tuned on the same test period it is reported on, so the κ=10 numbers are
-  slightly optimistic. Confirm on a second seed or dataset.
+- One dataset (mostly intermittent), one test period, local models only. No global or
+  foundation models were tested. Two seeds (two different sets of series) agree.
+- κ was tuned on the same test period it is reported on. The second seed picks the
+  same κ, but a second dataset or test period would be a stronger check.
 - CQR on native bands was not tested. Neither was recency weighting.
 
 ---
