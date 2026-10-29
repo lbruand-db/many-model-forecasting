@@ -391,7 +391,9 @@ intermittency class from profiling, a store, or a category.
   are therefore slightly pessimistic, giving conservative intervals. That is
   acceptable and standard.
 
-Concrete suggested defaults (to validate empirically):
+Recommended settings for users who want better intervals. These are **opt-in**: the
+README defaults are *not* changed (see §6.4 and §9). Values are to be validated
+empirically.
 
 | freq | prediction_length | backtest_length | stride | W |
 |---|---:|---:|---:|---:|
@@ -399,6 +401,37 @@ Concrete suggested defaults (to validate empirically):
 | W | 13 | 13 + 52 = 65 | 4 | 14 |
 | M | 6 | 6 + 18 = 24 | 2 | 10 |
 | H | 24 | 24 + 24·13 = 336 | 24 | 14 |
+
+### 6.4 Workaround: good intervals with the default W = 3
+
+`W` is the **number of backtest windows** (forecast origins) per series:
+
+```
+W = floor((backtest_length − prediction_length) / stride) + 1
+```
+
+With the README defaults (`backtest_length=30`, `prediction_length=10`, `stride=10`),
+the origins are at `T−29`, `T−19` and `T−9`, so W = 3. Each window gives one error per
+horizon step, so every series has only 3 errors per step. Raising W multiplies the
+refit cost of local models by W/3, so the defaults stay as they are. The workarounds
+below need no change to `backtest_length` or `stride`:
+
+1. **Pool across series** (`coverage.target: marginal | group`, §7.6). This is the
+   main lever: a pool holds `3 · N_group` scores per step, e.g. 3 000 for a group of
+   1 000 series. It costs nothing extra.
+2. **Pool across horizon steps within a series** (`pool_horizon`, §7.6.3 Option 3).
+   This gives n = W·h = 30 scores per series (enough for a finite 90% bound) and
+   restores error growth with a group-level step profile.
+3. **Shrink per-series quantiles toward the group** (`shrinkage_kappa`). Short
+   histories automatically lean on the group.
+4. **Denser calibration windows only where they are cheap** (optional, P1). Global and
+   foundation models are *not* refit per window (§2), so an optional
+   `calibration_stride` (e.g. 1) can add windows for those families at
+   prediction-only cost. Local models keep the default stride.
+5. **Fail loudly instead of under-covering.** When a pool has fewer than
+   `⌈2/α⌉ − 1` scores for a requested level (two-sided, signed), widen to the next
+   pooling level, or emit `null` bounds with a warning. Never silently clip to the
+   max score, as statsforecast and AutoGluon do.
 
 ---
 
@@ -426,12 +459,11 @@ and `actual` arrays), so there is **no extra training**:
    MAE of the seasonal naive) on the training part. Fall back to the mean of `|y|`.
 3. Compute signed normalised scores `e = (y − ŷ)/σ̂_i`.
 4. For each `(model, pool, step j)`, store the conformal quantiles of `e` for the
-   lower (`α/2`) and upper (`1−α/2`) sides, optionally recency-weighted. Here `pool`
-   is one of `series`, `segment` (from a user column such as an intermittency class
-   or category) or `global`. Automatic fallback: use `series` if `W ≥ ⌈2/α⌉ − 1`,
-   else `segment`, else `global`.
-5. Persist the result to a new table `calibration_output` (`run_id`, `model`, `pool`,
-   `step`, `level`, `q_lo`, `q_hi`, `n_scores`).
+   lower (`α/2`) and upper (`1−α/2`) sides, optionally recency-weighted. What a `pool`
+   is depends on `coverage.target` (`marginal`, `group` or `series`). See §7.6.
+5. Persist the result to a new table `calibration_output` (`run_id`, `model`,
+   `coverage_target`, `pool_key`, `step`, `level`, `q_lo`, `q_hi`, `n_scores`,
+   `shrinkage_weight`).
 
 Scoring then produces `lo = ŷ + σ̂_i·q_lo` and `hi = ŷ + σ̂_i·q_hi`. After that, the
 lower bound is optionally clipped according to `clip_lower` (§7.3.1).
@@ -446,11 +478,17 @@ prediction_intervals:
   enabled: true
   levels: [80, 95]            # or quantiles: [0.1, 0.5, 0.9]
   method: conformal           # conformal | native | cqr (native+conformal)
-  pooling: auto               # series | segment | global | auto
-  segment_col: null           # e.g. "intermittency_class"
+  coverage:                   # see §7.6
+    target: group             # marginal | group | series
+    group_col: null           # e.g. "abc_class", "intermittency_class"; null = one global group
+    min_scores_per_group: 100 # smaller groups are merged into a global "other" pool
+    levels_by_group: null     # e.g. {A: [95], B: [90], C: [80]}; overrides `levels`
+    shrinkage_kappa: 20       # series target only: q_i = λ·q_series + (1-λ)·q_group, λ = n_i/(n_i+κ)
+    pool_horizon: auto        # series target only: pool steps within a series (auto = if W < 19)
   score: signed_normalized    # abs | signed | signed_normalized
   recency_decay: null         # e.g. 0.9 per window (weighted conformal)
   clip_lower: auto            # auto | none | <number>, see §7.3.1
+  output_format: quantile_map # quantile_map | lo_hi | both, see §7.4
 ```
 
 #### 7.3.1 Lower-bound clipping (`clip_lower`)
@@ -488,20 +526,162 @@ Notes:
 
 ### 7.4 Output schema changes
 
-- `scoring_output`: add `<target>_lo_<lv>` / `<target>_hi_<lv>` array columns (one per
-  level), or a `quantiles` map of `level → array`. Pick one and document it. The first
-  form matches Snowflake/BigQuery; the second scales better.
-- `evaluation_output`: add per-window interval metrics (§8) when intervals are enabled.
+`scoring_output` gets new columns, controlled by `output_format`:
+
+| `output_format` | Columns added | Notes |
+|---|---|---|
+| `quantile_map` (**default**) | `<target>_quantiles: MAP<STRING, ARRAY<DOUBLE>>`, keyed by quantile level (`"0.025"`, `"0.1"`, `"0.9"`, `"0.975"`, ...), one array of length `prediction_length` per key | Schema is stable whatever levels are configured, and it scales to many quantiles (e.g. M5-style 9 quantiles). A central PI at level `L` lives under keys `(1−L/100)/2` and `1−(1−L/100)/2`. |
+| `lo_hi` | `<target>_lo_<L>`, `<target>_hi_<L>: ARRAY<DOUBLE>` for each level `L` in `levels` (e.g. `y_lo_80`, `y_hi_80`, `y_lo_95`, `y_hi_95`) | Matches the Snowflake/BigQuery style (`LOWER_BOUND/UPPER_BOUND`). Easiest for SQL, Genie and dashboards (`examples/fresh_retail_net`). The schema changes when levels change. |
+| `both` | Both of the above | Convenience for dashboards while keeping the map as the canonical form. |
+
+Key naming in the map: quantile levels are formatted with no trailing zeros
+(`"0.1"`, not `"0.10"`). The median `"0.5"` is included only when `method` produces it
+(native/CQR). With conformal, the point forecast stays in `<target>`.
+
+`evaluation_output` also gets per-window interval metrics (§8) when intervals are
+enabled.
 
 ### 7.5 Phasing
 
-1. **P0**: Layer B with `global` and `segment` pooling, plus interval metrics. This is
-   model-agnostic and has no training cost.
+1. **P0**: Layer B with `coverage.target: marginal | group`, plus interval metrics.
+   This is model-agnostic and has no training cost. `series` (with shrinkage) can
+   follow in P0.5 once group-level calibration is validated.
 2. **P1**: Layer A for foundation models and statsforecast, plus CQR.
 3. **P2**: NeuralForecast probabilistic losses (`MQLoss`, `DistributionLoss`, NegBin),
    and LightGBM quantile objective.
 4. **P3**: probabilistic hierarchical reconciliation, and online ACI in a monitoring
    job.
+
+### 7.6 Coverage target: marginal vs group vs per-series
+
+This section answers open question 1: **for which population must "90% coverage" hold?**
+
+- **Marginal coverage:** 90% of all (series, date) points fall in their interval.
+  Some series can be at 70% and others at 99%.
+- **Group-conditional coverage:** 90% holds within each group (e.g. ABC class, store,
+  intermittency class).
+- **Per-series coverage:** 90% holds for each series individually.
+
+The stronger the target, the more calibration data it needs (§6) and the wider the
+intervals become for short or noisy series.
+
+#### 7.6.1 What other products and libraries actually do
+
+| Product / library | Where calibration scores come from | Pool | Effective coverage target |
+|---|---|---|---|
+| **statsforecast** `ConformalIntervals` | `n_windows` refits at the end of **each series** | Per series × per step: `n_windows` scores (default 2) | **Per series** in intent, but with n=2 the bound is the max of 2 errors, so there is no real guarantee |
+| **mlforecast** `PredictionIntervals` (default) | CV windows; scores reshaped `(n_windows, n_series, h)` and quantiled over windows only | Per series × per step | **Per series** (same caveat) |
+| **mlforecast** transfer methods (`ScaleAlignment`, `ErrorScaling`, `Recalibration`; on `main`, newer than the MMF pin) | Scores "**pooled over every calibration series**", normalised by a per-series scale (MAD or std of Δy) | All series × per step, signed | **Marginal**, scale-adapted per series. This is the same idea as §7.2. |
+| **neuralforecast** `PredictionIntervals` | Same Nixtla scheme as mlforecast | Per series × per step | Per series |
+| **Nixtla TimeGPT** | Rolling historical forecasts per series (server-side) | Per series | Per series (details not public) |
+| **AutoGluon-TimeSeries** (Croston/ADIDA/IMAPA "conformalized" models) | Up to **5** windows per series, absolute errors "**pooled across the prediction horizon**" | Per series, all steps (n ≤ 5·h), constant width | **Per series**, at the cost of ignoring error growth with horizon |
+| AutoGluon / Amazon Forecast / SageMaker DeepAR / Chronos / TimesFM | Model likelihood or quantile loss, trained globally | Implicit (global model) | **Marginal** over the training distribution, with no guarantee |
+| BigQuery ARIMA_PLUS, Snowflake, Prophet, Databricks AutoML | Per-series model variance or simulation | n/a (parametric) | Per series in form, with no calibration guarantee |
+| Azure AutoML | Std-dev of validation-fold residuals (`ForecastingPipelineWrapper.stddev`) | Not documented | Not documented |
+
+Sources: statsforecast `python/statsforecast/models.py` (`_conformity_scores`),
+mlforecast `mlforecast/conformal_prediction.py` (`_add_conformal_*_intervals`,
+`_add_transfer_intervals`), AutoGluon
+`timeseries/src/autogluon/timeseries/models/local/statsforecast.py`
+(`AbstractConformalizedStatsForecastModel`, `max_num_conformalization_windows = 5`),
+Azure `ForecastingPipelineWrapper` API reference.
+
+Observations:
+1. **Every conformal library defaults to per-series calibration**, but with 2–5 windows.
+   They accept a noisy and under-covering result rather than pool. Nobody exposes the
+   coverage target as an explicit choice.
+2. Nixtla's newest code adds **cross-series pooling with per-series scaling** for
+   series with little or no history ("transfer"). This is the first sign of a library
+   moving to MMF's situation.
+3. AutoGluon shows the other cheap trick: **pool across horizon steps within a series**
+   (n = W·h). This gives enough scores, but the interval width no longer grows with
+   the horizon.
+
+#### 7.6.2 What safety-stock users need
+
+- Inventory policies set service levels **per SKU** (cycle service level, so that
+  safety stock is `z_α·σ_L` per item; Silver, Pyke & Thomas, 2017). In practice the
+  targets are set **per class**: ABC/XYZ classes get different service levels, such as
+  A=95%, B=90%, C=80% (Teunter, Babai & Syntetos, 2010).
+- Planners notice per-SKU failures. A marginal 90% that hides 60% coverage on all
+  fast movers is a real business problem. A class-level guarantee is what the
+  service-level *policy* is written against.
+- Empirical studies of safety stocks show that variance from forecast errors
+  underestimates the true uncertainty (Prak, Teunter & Syntetos, 2017). Empirical
+  quantiles per SKU work when there is enough history (Trapero, Cardós & Kourentzes,
+  2019). This argues for empirical (conformal) calibration over parametric `z·σ`, at
+  a level of pooling that the data can support.
+
+Conclusion: the realistic requirement is **group-conditional coverage at the
+service-level class**, with per-series adaptivity through scale normalisation. Per-series
+guarantees are desirable but only achievable with long backtests.
+
+#### 7.6.3 Three options (all configurable via `coverage.target`)
+
+**Option 1: `marginal`** (global pool, normalised scores)
+
+- Pool: all series of a model × step `j`. The scores `e = (y−ŷ)/σ̂_i` are already
+  scale-adapted, so a large series gets a proportionally wide interval.
+- Guarantee: `≥ 1−α` on average over all (series, date) points. The split-conformal
+  guarantee holds under exchangeability across series and windows (Lei et al., 2018).
+- Data need: `W · N ≥ ~100` scores per step, which is trivially met even with the
+  default W=3.
+- Risk: heterogeneous populations. Intermittent series are typically under-covered
+  and smooth series over-covered, because one pooled quantile fits neither.
+- When to use: quick start, homogeneous series, dashboards, when no grouping column
+  exists.
+
+**Option 2: `group`** (Mondrian / group-conditional conformal) — **recommended default**
+
+- Pool: series sharing a `group_col` value × step `j`. These are Mondrian conformal
+  predictors (Vovk et al., 2003): running split conformal separately inside each
+  category gives the `1−α` guarantee **within every group**.
+- Suggested `group_col`: ABC class, the intermittency class from the profiling skill
+  (smooth / erratic / intermittent / lumpy), category or store. A combination such as
+  `abc_xyz` also works.
+- `levels_by_group` maps the service-level policy directly, e.g. A: 95%, C: 80%.
+- Data need: `W · N_group ≥ min_scores_per_group` (default 100; ≥ ~40 is enough for
+  a finite 95% bound). Smaller groups are merged into a pooled "other" group, and the
+  merge is logged.
+- If `group_col` is null, this is identical to `marginal`.
+- Extension (later): Gibbs, Cherian & Candès (2025) give conformal methods with
+  coverage guaranteed over *overlapping* groups, e.g. both "store" and "category" at
+  once.
+
+**Option 3: `series`** (per-series, with shrinkage to the group)
+
+- Pool: the series' own scores. Two tricks keep it usable when W is small:
+  1. **Horizon pooling** (`pool_horizon`). Pool all steps of the series
+     (n = W·h, as AutoGluon does), then restore error growth with a **step profile
+     learned at group level**: `q_i,j = q_i · r_j`, where `r_j` is the ratio of the
+     step-`j` quantile to the all-steps quantile in the series' group. The series sets
+     the level and the group sets the shape.
+  2. **Shrinkage** (partial pooling, credibility-style):
+     `q_i = λ_i · q_series,i + (1−λ_i) · q_group`, with `λ_i = n_i/(n_i+κ)` and
+     `κ = shrinkage_kappa` (default 20). Short series fall back toward the group
+     quantile, and series with a long history get their own.
+- Guarantee: **no finite-sample guarantee** for the shrunk quantile. Coverage must be
+  checked empirically per series (§8). Exact per-series conformal is recovered when
+  `λ_i → 1`, which needs n_i ≥ 19 for 90% (§6.1).
+- Data need: works with W=3 thanks to shrinkage, but intervals only become truly
+  series-specific once `W·h ≳ 2κ`.
+- When to use: long histories, high-value SKUs, or users who explicitly want
+  per-series bands.
+
+Summary:
+
+| | `marginal` | `group` (default) | `series` |
+|---|---|---|---|
+| Guarantee | Average over all points | Within each group | Empirical only (exact when n_i large) |
+| Works with default W=3 | ✅ | ✅ if groups have ≥ ~35 series | ✅ via shrinkage (mostly group-driven) |
+| Adaptive to series scale | ✅ (normalised scores) | ✅ | ✅✅ |
+| Adaptive to series *shape* (e.g. erratic vs smooth) | ❌ | ✅ (if the grouping captures it) | ✅ |
+| Matches safety-stock practice | Weak | **ABC/XYZ service levels** | Per-SKU service level |
+| Extra compute | none | none | none (all from `evaluation_output`) |
+
+All three are computed from the same exploded backtest scores, so MMF can report
+coverage for all three views in `evaluation_output` whichever one drives the
+intervals. Users then see the trade-off on their own data before switching.
 
 ---
 
@@ -526,12 +706,19 @@ infinitely wide intervals always cover.
 
 ## 9. Open questions
 
-1. Is the target marginal coverage over series (cheap, stable) or per-series coverage
-   (needs a long backtest)? What do MMF users actually need for safety stock?
-2. Which output schema: wide `lo/hi` columns or a quantile map? This affects the
-   Genie/dashboard views in `examples/fresh_retail_net`.
-3. Should we change the README defaults so that W ≥ 10, given the cost for local
-   models on big data?
+1. ~~Marginal vs per-series coverage?~~ **Decided: configurable.**
+   `coverage.target: marginal | group | series`, with `group` as the default. See
+   §7.6 for the product survey, safety-stock rationale and the three options.
+   *Remaining:* which grouping column to suggest by default (ABC from revenue vs
+   intermittency class from profiling), and the default `shrinkage_kappa`. Both should
+   be tuned on a benchmark such as M5 or `fresh_retail_net`.
+2. ~~Output schema?~~ **Decided:** quantile map by default, with lo/hi columns
+   available (`output_format: quantile_map | lo_hi | both`, §7.4).
+   *Remaining:* whether the `fresh_retail_net` Genie views should use `both`.
+3. ~~Change README defaults to W ≥ 10?~~ **Decided: no.** Defaults stay at W = 3. Use
+   the cross-series and horizon pooling and shrinkage workarounds in §6.4. The longer
+   backtest settings in §6.3 are documented as opt-in.
+
 4. Should calibration live in the evaluation run, in scoring, or as a separate step
    (`run_calibration`)? Scoring currently does not read `evaluation_output`.
 5. Do we want *joint* trajectory coverage (Bonferroni / CF-RNN) or per-step coverage?
@@ -562,6 +749,8 @@ Conformal prediction & time series
 - Xu, C., Xie, Y. (2023). Sequential predictive conformal inference for time series (SPCI). *ICML*.
 - Angelopoulos, A., Candès, E., Tibshirani, R. (2023). Conformal PID control for time series prediction. *NeurIPS*.
 - Angelopoulos, A., Bates, S. (2023). Conformal prediction: a gentle introduction. *Foundations and Trends in ML* (arXiv:2107.07511).
+- Vovk, V., Lindsay, D., Nouretdinov, I., Gammerman, A. (2003). Mondrian confidence machine. Technical report, Royal Holloway, University of London.
+- Gibbs, I., Cherian, J., Candès, E. (2025). Conformal prediction with conditional guarantees. *JRSS-B* (arXiv:2305.12616).
 
 Classical forecasting intervals & evaluation
 - Williams, W. H., Goodman, M. L. (1971). A simple method for the construction of empirical confidence limits for economic forecasts. *JASA* 66(336).
@@ -580,6 +769,12 @@ Intermittent demand
 - Syntetos, A., Boylan, J. (2005). The accuracy of intermittent demand estimates. *IJF* 21(2).
 - Snyder, R., Ord, J. K., Beaumont, A. (2012). Forecasting the intermittent demand for slow-moving inventories: a modelling approach. *IJF* 28(2).
 - Kolassa, S. (2016). Evaluating predictive count data distributions in retail sales forecasting. *IJF* 32(3).
+
+Inventory / safety stock
+- Silver, E., Pyke, D., Thomas, D. (2017). *Inventory and Production Management in Supply Chains*, 4th ed. CRC Press.
+- Teunter, R., Babai, M. Z., Syntetos, A. (2010). ABC classification: service levels and inventory costs. *Production and Operations Management* 19(3).
+- Prak, D., Teunter, R., Syntetos, A. (2017). On the calculation of safety stocks when demand is forecasted. *EJOR* 256(2).
+- Trapero, J. R., Cardós, M., Kourentzes, N. (2019). Empirical safety stock estimation based on kernel and GARCH models. *Omega* 84.
 
 Models
 - Taylor, S., Letham, B. (2018). Forecasting at scale (Prophet). *The American Statistician* 72(1).
@@ -603,3 +798,6 @@ Library / product docs (accessed 2026-10)
 - Azure AutoML forecasting: https://learn.microsoft.com/en-us/azure/machine-learning/how-to-automl-forecasting-faq
 - Nixtla TimeGPT intervals/quantiles: https://nixtla.github.io/nixtlar/articles/prediction-intervals.html
 - Prophet uncertainty intervals: https://facebook.github.io/prophet/docs/uncertainty_intervals.html
+- mlforecast conformal & transfer intervals (source): https://github.com/Nixtla/mlforecast/blob/main/mlforecast/conformal_prediction.py
+- AutoGluon conformalized local models (source): https://github.com/autogluon/autogluon/blob/master/timeseries/src/autogluon/timeseries/models/local/statsforecast.py
+- Azure `ForecastingPipelineWrapper` (validation-fold `stddev`): https://learn.microsoft.com/en-us/python/api/azureml-training-tabular/azureml.training.tabular.models.forecasting_pipeline_wrapper.forecastingpipelinewrapper
