@@ -20,18 +20,24 @@ Branch: `docs/confidence-interval-spec`
   **9 windows for 90%** and **19 windows for 95%**, and it is still noisy at those
   sizes (±9 and ±5 coverage points respectively). With the README defaults
   (`backtest_length=30`, `stride=10`, `prediction_length=10`), MMF produces only
-  **3 windows**. Per-series calibration is therefore not viable by default. MMF's
-  advantage is **pooling scale-normalised residuals across many series** (by segment
-  and horizon step), which makes calibration stable even with only a few windows.
+  **3 windows**. Pure per-series calibration is therefore not viable by default. MMF's
+  advantage is **borrowing strength across many series**: per-series quantiles shrunk
+  toward a group pool (ABC×XYZ by default), which stays stable with only a few windows.
+  This was validated on M5 (§7.6.4).
+- **Native intervals, where a model has them, beat every conformal variant on interval
+  score** at similar coverage in the M5 experiment (AutoETS: MSIS 9.9 vs ≥ 15.5 at
+  95%). Conformal calibration is the fallback for models without native intervals,
+  not a replacement for them.
 - What similar products ship is very consistent: a configurable coverage level
   (default 0.95 in BigQuery and Snowflake), or a list of quantiles (default
   P10/P50/P90 in Amazon, TimeGPT and Azure), returned as `lower`/`upper` columns next
   to the point forecast.
 
 Recommended direction (detailed in §7):
-1. Pass native quantiles through where they exist, but keep this optional.
-2. Use model-agnostic, MMF-level conformal calibration from the backtest output as the
-   default and universal mechanism.
+1. Pass native quantiles through where they exist (`method: auto`), as the first choice.
+2. Use model-agnostic, MMF-level conformal calibration from the backtest output for every
+   model without native intervals. Default: `coverage.target: series`, with shrinkage
+   toward ABC×XYZ groups.
 3. Evaluate intervals with coverage, Winkler/MSIS and pinball loss in
    `evaluation_output`.
 
@@ -284,8 +290,12 @@ This is critical for MMF, given that its Croston/TSB/ADIDA defaults target retai
   Snyder, Ord & Beaumont (2012) give parametric count models (Poisson / NegBin
   state-space) as the classical alternative.
 - In practice, pool scores within an intermittency class: ADI/CV² (Syntetos–Boylan)
-  smooth / erratic / intermittent / lumpy. MMF already computes this in the optional
-  profiling skill (`skills/databricks-skills/many-model-forecasting/2-profile-and-classify-series.md`).
+  smooth / erratic / intermittent / lumpy. MMF does **not** compute this today. The
+  optional profiling skill
+  (`skills/databricks-skills/many-model-forecasting/2-profile-and-classify-series.md`)
+  only writes a two-valued `forecastability_class` (`high_confidence` / `low_signal`),
+  derived from sparsity, entropy and SNR. The classes are cheap to compute from the
+  target (§7.6.4 does it in a few lines).
 
 ### 4.5 Hierarchies
 
@@ -364,7 +374,7 @@ Calibration is per horizon step `j ∈ {1..h}`, because error grows with `j`. So
 | Global × per step, normalised | `W · N` | very large | Stable, but ignores heterogeneity |
 
 Here `N_segment` is the number of series in a homogeneous group, for example an
-intermittency class from profiling, a store, or a category.
+ABC×XYZ or Syntetos–Boylan class computed by MMF, a store, or a category.
 
 ### 6.3 Practical guidance (from the literature and the products)
 
@@ -437,7 +447,7 @@ below need no change to `backtest_length` or `stride`:
 
 ## 7. Proposed design (sketch for discussion)
 
-### 7.1 Layer A: native pass-through (optional, per family)
+### 7.1 Layer A: native pass-through (first choice where available)
 
 - statsforecast: call `predict(h, level=levels)` for models whose native PI is
   available (§3.1).
@@ -447,9 +457,11 @@ below need no change to `backtest_length` or `stride`:
 - Prophet: `predict_interval`.
 
 This gives "model-native" bands. They are **not guaranteed calibrated**, and they are
-**missing for half of the zoo**.
+**missing for half of the zoo**. On M5 they were nonetheless the sharpest intervals at
+near-nominal coverage (§7.6.4). Native AutoETS over-covered at 80% (0.87), which CQR can
+tighten. MMF should still report their empirical coverage (§8).
 
-### 7.2 Layer B: MMF conformal calibration (default, universal)
+### 7.2 Layer B: MMF conformal calibration (universal fallback)
 
 It runs after evaluation, entirely from `evaluation_output` (it already has `forecast`
 and `actual` arrays), so there is **no extra training**:
@@ -477,13 +489,14 @@ For models with native quantiles, Layer B can instead run **CQR** on the native 
 prediction_intervals:
   enabled: true
   levels: [80, 95]            # or quantiles: [0.1, 0.5, 0.9]
-  method: conformal           # conformal | native | cqr (native+conformal)
+  method: auto                # auto (native if available, else conformal) | conformal | native | cqr
   coverage:                   # see §7.6
-    target: group             # marginal | group | series
-    group_col: null           # e.g. "abc_class", "intermittency_class"; null = one global group
+    target: series            # marginal | group | series
+    group_col: auto           # auto = ABC×XYZ computed by MMF | sb_class | null | <column> | [col1, col2]
+    level_group_col: null     # e.g. "abc_class": drives levels_by_group, independent of group_col
     min_scores_per_group: 100 # smaller groups are merged into a global "other" pool
     levels_by_group: null     # e.g. {A: [95], B: [90], C: [80]}; overrides `levels`
-    shrinkage_kappa: 20       # series target only: q_i = λ·q_series + (1-λ)·q_group, λ = n_i/(n_i+κ)
+    shrinkage_kappa: 20       # series target only: q_i = λ·q_series + (1-λ)·q_group, λ = W/(W+κ)
     pool_horizon: auto        # series target only: pool steps within a series (auto = if W < 19)
   score: signed_normalized    # abs | signed | signed_normalized
   recency_decay: null         # e.g. 0.9 per window (weighted conformal)
@@ -543,10 +556,11 @@ enabled.
 
 ### 7.5 Phasing
 
-1. **P0**: Layer B with `coverage.target: marginal | group`, plus interval metrics.
-   This is model-agnostic and has no training cost. `series` (with shrinkage) can
-   follow in P0.5 once group-level calibration is validated.
-2. **P1**: Layer A for foundation models and statsforecast, plus CQR.
+1. **P0**: Layer B with all three `coverage.target` values (default `series` with
+   ABC×XYZ shrinkage), MMF-computed grouping columns (ABC, XYZ, Syntetos–Boylan),
+   interval metrics, and native pass-through for statsforecast (just `level=`). This is
+   model-agnostic and has no training cost.
+2. **P1**: Layer A for foundation models and Prophet, plus CQR.
 3. **P2**: NeuralForecast probabilistic losses (`MQLoss`, `DistributionLoss`, NegBin),
    and LightGBM quantile objective.
 4. **P3**: probabilistic hierarchical reconciliation, and online ACI in a monitoring
@@ -631,15 +645,29 @@ guarantees are desirable but only achievable with long backtests.
 - When to use: quick start, homogeneous series, dashboards, when no grouping column
   exists.
 
-**Option 2: `group`** (Mondrian / group-conditional conformal) — **recommended default**
+**Option 2: `group`** (Mondrian / group-conditional conformal) — choose when a
+per-group *guarantee* is required
 
 - Pool: series sharing a `group_col` value × step `j`. These are Mondrian conformal
   predictors (Vovk et al., 2003): running split conformal separately inside each
   category gives the `1−α` guarantee **within every group**.
-- Suggested `group_col`: ABC class, the intermittency class from the profiling skill
-  (smooth / erratic / intermittent / lumpy), category or store. A combination such as
-  `abc_xyz` also works.
-- `levels_by_group` maps the service-level policy directly, e.g. A: 95%, C: 80%.
+- `group_col` candidates:
+
+  | Grouping | Source | Captures | M5 result (§7.6.4) |
+  |---|---|---|---|
+  | **ABC×XYZ** (`auto`): ABC = 80/15/5 volume Pareto, XYZ = terciles of CV | MMF, from the target | Importance × variability | **Best of all groupings** in 12/12 configs (MSIS), best ABC balance |
+  | Syntetos–Boylan (`sb_class`): ADI 1.32 / CV² 0.49 cut-offs | MMF, from the target | Error-distribution shape | Best balance across its own classes, otherwise ≈ marginal |
+  | ABC alone | MMF (volume; revenue if a price column exists) | Importance | Second best |
+  | Error tier (terciles of seasonal-naive MAE / mean) | MMF | Difficulty | ≈ marginal |
+  | `forecastability_class` (profiling) | Profiling table, if present | Signal vs noise (2 groups) | Not tested |
+  | Business column (category, store, hierarchy level) | User | Domain segment | ≈ marginal (no gain) |
+
+  A list (e.g. `[sb_class, category]`) builds groups from the combinations. Small
+  groups are merged as below.
+- `levels_by_group` maps the service-level policy directly, e.g. A: 95%, C: 80%. The
+  service-level column (`level_group_col`, typically ABC) is separate from the
+  calibration grouping (`group_col`). Business importance decides *which* level a group
+  gets; error shape decides *how* the quantile is pooled.
 - Data need: `W · N_group ≥ min_scores_per_group` (default 100; ≥ ~40 is enough for
   a finite 95% bound). Smaller groups are merged into a pooled "other" group, and the
   merge is logged.
@@ -648,7 +676,7 @@ guarantees are desirable but only achievable with long backtests.
   coverage guaranteed over *overlapping* groups, e.g. both "store" and "category" at
   once.
 
-**Option 3: `series`** (per-series, with shrinkage to the group)
+**Option 3: `series`** (per-series, with shrinkage to the group) — **recommended default**
 
 - Pool: the series' own scores. Two tricks keep it usable when W is small:
   1. **Horizon pooling** (`pool_horizon`). Pool all steps of the series
@@ -657,23 +685,29 @@ guarantees are desirable but only achievable with long backtests.
      step-`j` quantile to the all-steps quantile in the series' group. The series sets
      the level and the group sets the shape.
   2. **Shrinkage** (partial pooling, credibility-style):
-     `q_i = λ_i · q_series,i + (1−λ_i) · q_group`, with `λ_i = n_i/(n_i+κ)` and
+     `q_i = λ_i · q_series,i + (1−λ_i) · q_group`, with `λ_i = W_i/(W_i+κ)` and
      `κ = shrinkage_kappa` (default 20). Short series fall back toward the group
      quantile, and series with a long history get their own.
+     **Count windows, not points.** The weight must use the number of windows `W_i`
+     (independent forecast origins), not `W_i·h`. Errors within a window are strongly
+     correlated, so `W·h` overstates the evidence. On M5, `λ = W·h/(W·h+κ)` (≈ 0.8 at
+     W=3) under-covered badly (0.74 at 80%, 0.89 at 95%), while `λ = W/(W+κ)` (≈ 0.13
+     at W=3, 0.375 at W=12) was well calibrated (§7.6.4).
 - Guarantee: **no finite-sample guarantee** for the shrunk quantile. Coverage must be
   checked empirically per series (§8). Exact per-series conformal is recovered when
-  `λ_i → 1`, which needs n_i ≥ 19 for 90% (§6.1).
-- Data need: works with W=3 thanks to shrinkage, but intervals only become truly
-  series-specific once `W·h ≳ 2κ`.
-- When to use: long histories, high-value SKUs, or users who explicitly want
-  per-series bands.
+  `λ_i → 1`, which needs W ≥ 19 for 90% (§6.1).
+- Data need: works with W=3 thanks to shrinkage. It becomes mostly series-specific
+  once `W ≳ κ`.
+- When to use: the default. It had the best interval score of all the universal
+  methods on M5 at near-nominal coverage, for W=3 and W=12.
 
 Summary:
 
-| | `marginal` | `group` (default) | `series` |
+| | `marginal` | `group` | `series` (default) |
 |---|---|---|---|
-| Guarantee | Average over all points | Within each group | Empirical only (exact when n_i large) |
-| Works with default W=3 | ✅ | ✅ if groups have ≥ ~35 series | ✅ via shrinkage (mostly group-driven) |
+| Guarantee | Average over all points | Within each group | Empirical only (exact when W large) |
+| Works with default W=3 | ✅ | ✅ if groups have ≥ ~35 series | ✅ via shrinkage (mostly group-driven at W=3) |
+| M5 MSIS, AutoETS 95%, W=3 (§7.6.4) | 17.4 | 16.1 (ABC×XYZ) | **15.5** |
 | Adaptive to series scale | ✅ (normalised scores) | ✅ | ✅✅ |
 | Adaptive to series *shape* (e.g. erratic vs smooth) | ❌ | ✅ (if the grouping captures it) | ✅ |
 | Matches safety-stock practice | Weak | **ABC/XYZ service levels** | Per-SKU service level |
@@ -682,6 +716,83 @@ Summary:
 All three are computed from the same exploded backtest scores, so MMF can report
 coverage for all three views in `evaluation_output` whichever one drives the
 intervals. Users then see the trade-off on their own data before switching.
+
+#### 7.6.4 Experiment: choosing the options on M5
+
+Notebook: `docs/specs/experiments/pi_grouping_m5.py`. Raw results:
+`docs/specs/experiments/pi_grouping_m5_results.json`. It ran on serverless in the
+`fe-sandbox-air-eu-test` workspace, taking 20 min.
+
+**Setup**
+
+- **Data:** 4,966 random M5 item×store series (seed 7). Leading zeros were trimmed,
+  and only series with at least a year of history before calibration were kept. The
+  mix is 77% intermittent, 13% lumpy, 8% smooth and 2% erratic (Syntetos–Boylan), and
+  32/32/36% A/B/C.
+- **Models:** SeasonalNaive(7), CrostonSBA and AutoETS(ZNZ, 7), refit for every window
+  (statsforecast `cross_validation`, as MMF local models do). h = 28.
+- **Calibration:** windows strictly before the test period, with stride 14. W=3 is
+  the last 3 windows (MMF-default-like); W=12 is all of them.
+- **Test:** 4 non-overlapping 28-day windows (2016-02-01 to 2016-05-22), never seen
+  during calibration.
+- **Scoring:** signed scores normalised by the in-sample seasonal-naive MAE, exact
+  finite-sample conformal ranks, and the lower bound clipped at 0.
+- **Grouping features** use only data from before the first calibration window.
+- **Metrics:** coverage, MSIS (interval score / seasonal-naive MAE; lower is better),
+  and the worst coverage gap across the four Syntetos–Boylan classes and across A/B/C.
+
+**Results**, AutoETS with W=3 (CrostonSBA and SeasonalNaive show the same ranking):
+
+| Method | Coverage at 80% | MSIS at 80% | Coverage at 95% | MSIS at 95% | Worst class gap at 95% (SB / ABC) |
+|---|---|---|---|---|---|
+| marginal | 0.773 | 7.50 | 0.942 | 17.4 | 0.036 / 0.055 |
+| group: Syntetos–Boylan | 0.773 | 7.48 | 0.943 | 17.2 | 0.014 / 0.047 |
+| group: ABC | 0.773 | 7.43 | 0.942 | 16.5 | 0.017 / 0.011 |
+| **group: ABC×XYZ** | 0.775 | 7.40 | 0.942 | 16.1 | **0.012 / 0.011** |
+| group: category / store / error tier / SB×category | ≈ marginal | ≈ marginal | ≈ marginal | ≈ marginal | no better |
+| **series, λ = W/(W+κ)** (shrunk to SB groups) | 0.775 | **7.22** | 0.944 | **15.5** | 0.015 / 0.044 |
+| series, λ = W·h/(W·h+κ) | 0.737 | 6.70 | 0.890 | 13.4 | 0.068 / 0.092 |
+| Nixtla style: per series × step, absolute | 0.700 | 7.05 | **0.700** | 19.6 | 0.258 / 0.274 |
+| AutoGluon style: per series, steps pooled, absolute | 0.714 | 6.70 | 0.900 | 12.9 | 0.055 / 0.063 |
+| AutoETS native (statsforecast `level=`) | 0.872 | **5.93** | 0.944 | **9.9** | 0.015 / 0.015 |
+
+With W=12, the series option at 95% scores 12.9, against 16.2 for ABC×XYZ groups.
+Nixtla-style recovers at 80% (0.806 coverage, 6.43) but still under-covers at 95%
+(0.894).
+
+**Findings**
+
+1. **Grouping column:** ABC×XYZ ranked first among all groupings in every one of the 12
+   model × level × W combinations. Syntetos–Boylan gives the best balance across its
+   own classes. Business columns (category, store) bring nothing over marginal. The
+   differences are small, 1–7% MSIS. → **`group_col: auto` = ABC×XYZ.**
+2. **Coverage target:** per-series shrinkage counting *windows* is the best universal
+   method. It is near-nominal (0.775 / 0.944), and it beats the best grouping on MSIS
+   in all 12 model × level × W combinations. → **`coverage.target: series`** by default. `group` remains available when
+   a per-group guarantee is required.
+3. **Normalisation is not enough.** At equal coverage, pooled methods have a much worse
+   interval score than native intervals (AutoETS at 95%: 16–17 vs 9.9). The seasonal-naive scale does
+   not size each series' interval well, and misses on spiky series are large and
+   heavily penalised. This is why per-series adaptivity matters more than the choice of
+   group.
+4. **Native intervals first.** Where available (AutoETS, SeasonalNaive), native
+   intervals beat every conformal variant on MSIS. → `method: auto`.
+5. **The product baselines fail as §6 predicts.** With W=3, Nixtla-style calibration
+   collapses to the maximum of 3 errors (0.70 coverage at 95%). AutoGluon-style
+   horizon pooling is sharp but under-covers by 5–9 points.
+6. All pooled methods under-cover by about 2–3 points at 80%. This is likely
+   calibration-to-test drift (Aug 2015–Jan 2016 vs Feb–May 2016) and correlated
+   scores. Recency weighting is worth testing.
+
+**Caveats and follow-ups**
+
+- One dataset (mostly intermittent), one test period, one seed, local models only. No
+  global or foundation models were tested.
+- There are no error bars on the metrics. The small gaps between groupings (1–7%)
+  need a second seed or a bootstrap over series to confirm.
+- **The recommended combination is not yet tested.** The `series` runs shrank toward
+  Syntetos–Boylan groups, not ABC×XYZ. A run with ABC×XYZ shrinkage is the next step.
+- `κ = 20` was not tuned. Neither was CQR on native bands.
 
 ---
 
@@ -706,12 +817,12 @@ infinitely wide intervals always cover.
 
 ## 9. Open questions
 
-1. ~~Marginal vs per-series coverage?~~ **Decided: configurable.**
-   `coverage.target: marginal | group | series`, with `group` as the default. See
-   §7.6 for the product survey, safety-stock rationale and the three options.
-   *Remaining:* which grouping column to suggest by default (ABC from revenue vs
-   intermittency class from profiling), and the default `shrinkage_kappa`. Both should
-   be tuned on a benchmark such as M5 or `fresh_retail_net`.
+1. ~~Marginal vs per-series coverage? Which grouping column?~~ **Decided: configurable,
+   chosen on M5** (§7.6.4). `coverage.target: series` (shrinkage with `λ = W/(W+κ)`)
+   by default, `group_col: auto` = ABC×XYZ, and `method: auto` (native first).
+   *Remaining:* confirm series shrinkage toward ABC×XYZ (only tested toward
+   Syntetos–Boylan), tune `shrinkage_kappa`, add a second seed or dataset
+   (`fresh_retail_net`), and test global and foundation models.
 2. ~~Output schema?~~ **Decided:** quantile map by default, with lo/hi columns
    available (`output_format: quantile_map | lo_hi | both`, §7.4).
    *Remaining:* whether the `fresh_retail_net` Genie views should use `both`.
