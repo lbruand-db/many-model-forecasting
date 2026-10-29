@@ -48,6 +48,8 @@ LEVELS = [80, 95]
 FEATURE_DAYS = 365     # history used for sigma and grouping features
 MIN_SCORES_PER_GROUP = 100
 KAPPA = 20
+KAPPAS = [5, 10, 20, 40]               # shrinkage sweep for the series option (no extra fits)
+SHRINK_GROUP_COLS = ["sb", "abc_xyz"]  # groups the series option shrinks toward
 t0 = time.time()
 
 # COMMAND ----------
@@ -341,25 +343,34 @@ for model in MODELS:
                 q_lo, q_hi, inf = group_quantiles(E, F.loc[ids, col].to_numpy(), level)
                 results.append(evaluate(f"group:{col}", model, W, level, *from_q(q_lo, q_hi), yhat_test, inf.mean()))
 
-            # Option 3: per-series, horizon-pooled, step profile + shrinkage toward the SB group.
-            g_lo, g_hi, _ = group_quantiles(E, F.loc[ids, "sb"].to_numpy(), level)
-            sb = F.loc[ids, "sb"].to_numpy()
-            r_lo = np.ones((N, H))
-            r_hi = np.ones((N, H))
-            for g in np.unique(sb):
-                m = sb == g
-                all_lo, all_hi, _ = tail_quantiles(E[m].reshape(-1), level)
-                if abs(all_lo) > 1e-9:
-                    r_lo[m] = g_lo[m] / all_lo
-                if abs(all_hi) > 1e-9:
-                    r_hi[m] = g_hi[m] / all_hi
+            # Option 3: per-series, horizon-pooled, step profile + shrinkage toward a group.
             s_lo, s_hi, s_inf = tail_quantiles(E.reshape(N, -1).T, level)  # per series, n = W*H
-            for n_eff_name, n_eff in [("nWH", W * H), ("nW", W)]:
-                lam = n_eff / (n_eff + KAPPA)
-                q_lo = lam * s_lo[:, None] * r_lo + (1 - lam) * g_lo
-                q_hi = lam * s_hi[:, None] * r_hi + (1 - lam) * g_hi
-                results.append(evaluate(f"series_shrink_{n_eff_name}", model, W, level,
-                                        *from_q(q_lo, q_hi), yhat_test, float(s_inf)))
+            for gcol in SHRINK_GROUP_COLS:
+                labels = F.loc[ids, gcol].to_numpy()
+                g_lo, g_hi, _ = group_quantiles(E, labels, level)
+                r_lo = np.ones((N, H))
+                r_hi = np.ones((N, H))
+                for g in np.unique(labels):
+                    m = labels == g
+                    all_lo, all_hi, _ = tail_quantiles(E[m].reshape(-1), level)
+                    if abs(all_lo) > 1e-9:
+                        r_lo[m] = g_lo[m] / all_lo
+                    if abs(all_hi) > 1e-9:
+                        r_hi[m] = g_hi[m] / all_hi
+                variants = [("nW", W, k) for k in KAPPAS]
+                if gcol == "sb":
+                    variants.append(("nWH", W * H, KAPPA))
+                for n_eff_name, n_eff, kappa in variants:
+                    lam = n_eff / (n_eff + kappa)
+                    q_lo = lam * s_lo[:, None] * r_lo + (1 - lam) * g_lo
+                    q_hi = lam * s_hi[:, None] * r_hi + (1 - lam) * g_hi
+                    # Names of the first run (SB group, kappa=20) are kept for comparability.
+                    if gcol == "sb" and kappa == KAPPA:
+                        name = f"series_shrink_{n_eff_name}"
+                    else:
+                        name = f"series_shrink_{n_eff_name}:{gcol}:k{kappa}"
+                    results.append(evaluate(name, model, W, level,
+                                            *from_q(q_lo, q_hi), yhat_test, float(s_inf)))
 
             # Baseline: Nixtla-style per series x per step, absolute raw scores (conformal_error).
             q, inf = abs_quantile(A.transpose(1, 0, 2), level)          # (N, H)

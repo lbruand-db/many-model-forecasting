@@ -25,7 +25,7 @@ Branch: `docs/confidence-interval-spec`
   toward a group pool (ABC×XYZ by default), which stays stable with only a few windows.
   This was validated on M5 (§7.6.4).
 - **Native intervals, where a model has them, beat every conformal variant on interval
-  score** at similar coverage in the M5 experiment (AutoETS: MSIS 9.9 vs ≥ 15.5 at
+  score** at similar coverage in the M5 experiment (AutoETS: MSIS 9.9 vs ≥ 13.9 at
   95%). Conformal calibration is the fallback for models without native intervals,
   not a replacement for them.
 - What similar products ship is very consistent: a configurable coverage level
@@ -496,7 +496,7 @@ prediction_intervals:
     level_group_col: null     # e.g. "abc_class": drives levels_by_group, independent of group_col
     min_scores_per_group: 100 # smaller groups are merged into a global "other" pool
     levels_by_group: null     # e.g. {A: [95], B: [90], C: [80]}; overrides `levels`
-    shrinkage_kappa: 20       # series target only: q_i = λ·q_series + (1-λ)·q_group, λ = W/(W+κ)
+    shrinkage_kappa: 10       # series target only: q_i = λ·q_series + (1-λ)·q_group, λ = W/(W+κ)
     pool_horizon: auto        # series target only: pool steps within a series (auto = if W < 19)
   score: signed_normalized    # abs | signed | signed_normalized
   recency_decay: null         # e.g. 0.9 per window (weighted conformal)
@@ -686,13 +686,14 @@ per-group *guarantee* is required
      the level and the group sets the shape.
   2. **Shrinkage** (partial pooling, credibility-style):
      `q_i = λ_i · q_series,i + (1−λ_i) · q_group`, with `λ_i = W_i/(W_i+κ)` and
-     `κ = shrinkage_kappa` (default 20). Short series fall back toward the group
+     `κ = shrinkage_kappa` (default 10, tuned on M5, §7.6.4). Short series fall back toward the group
      quantile, and series with a long history get their own.
      **Count windows, not points.** The weight must use the number of windows `W_i`
      (independent forecast origins), not `W_i·h`. Errors within a window are strongly
      correlated, so `W·h` overstates the evidence. On M5, `λ = W·h/(W·h+κ)` (≈ 0.8 at
-     W=3) under-covered badly (0.74 at 80%, 0.89 at 95%), while `λ = W/(W+κ)` (≈ 0.13
-     at W=3, 0.375 at W=12) was well calibrated (§7.6.4).
+     W=3) under-covered badly (0.74 at 80%, 0.89 at 95%), while `λ = W/(W+κ)` was well
+     calibrated (§7.6.4). With κ=20 that is λ ≈ 0.13 at W=3 and 0.375 at W=12; with the
+     default κ=10 it is 0.23 and 0.55.
 - Guarantee: **no finite-sample guarantee** for the shrunk quantile. Coverage must be
   checked empirically per series (§8). Exact per-series conformal is recovered when
   `λ_i → 1`, which needs W ≥ 19 for 90% (§6.1).
@@ -707,7 +708,7 @@ Summary:
 |---|---|---|---|
 | Guarantee | Average over all points | Within each group | Empirical only (exact when W large) |
 | Works with default W=3 | ✅ | ✅ if groups have ≥ ~35 series | ✅ via shrinkage (mostly group-driven at W=3) |
-| M5 MSIS, AutoETS 95%, W=3 (§7.6.4) | 17.4 | 16.1 (ABC×XYZ) | **15.5** |
+| M5 MSIS, AutoETS 95%, W=3 (§7.6.4) | 17.4 | 16.1 (ABC×XYZ) | **13.9** (ABC×XYZ, κ=10) |
 | Adaptive to series scale | ✅ (normalised scores) | ✅ | ✅✅ |
 | Adaptive to series *shape* (e.g. erratic vs smooth) | ❌ | ✅ (if the grouping captures it) | ✅ |
 | Matches safety-stock practice | Weak | **ABC/XYZ service levels** | Per-SKU service level |
@@ -719,9 +720,10 @@ intervals. Users then see the trade-off on their own data before switching.
 
 #### 7.6.4 Experiment: choosing the options on M5
 
-Notebook: `docs/specs/experiments/pi_grouping_m5.py`. Raw results:
-`docs/specs/experiments/pi_grouping_m5_results.json`. It ran on serverless in the
-`fe-sandbox-air-eu-test` workspace, taking 20 min.
+Notebook: `docs/specs/experiments/pi_grouping_m5.py`. Raw results (232 rows, from the
+confirmation run): `docs/specs/experiments/pi_grouping_m5_results.json`. It ran on
+serverless in the `fe-sandbox-air-eu-test` workspace (runs `878662839893805` and
+`324298550294595`), taking about 20 min each.
 
 **Setup**
 
@@ -750,15 +752,38 @@ Notebook: `docs/specs/experiments/pi_grouping_m5.py`. Raw results:
 | group: ABC | 0.773 | 7.43 | 0.942 | 16.5 | 0.017 / 0.011 |
 | **group: ABC×XYZ** | 0.775 | 7.40 | 0.942 | 16.1 | **0.012 / 0.011** |
 | group: category / store / error tier / SB×category | ≈ marginal | ≈ marginal | ≈ marginal | ≈ marginal | no better |
-| **series, λ = W/(W+κ)** (shrunk to SB groups) | 0.775 | **7.22** | 0.944 | **15.5** | 0.015 / 0.044 |
+| series, λ = W/(W+κ), κ=20, shrunk to SB groups | 0.775 | 7.22 | 0.944 | 15.5 | 0.015 / 0.044 |
+| series, λ = W/(W+κ), κ=20, shrunk to ABC×XYZ | 0.777 | 7.15 | 0.942 | 14.7 | 0.012 / 0.011 |
+| **series, λ = W/(W+κ), κ=10, shrunk to ABC×XYZ** (recommended default) | 0.777 | **7.00** | 0.941 | **13.9** | **0.013 / 0.013** |
 | series, λ = W·h/(W·h+κ) | 0.737 | 6.70 | 0.890 | 13.4 | 0.068 / 0.092 |
 | Nixtla style: per series × step, absolute | 0.700 | 7.05 | **0.700** | 19.6 | 0.258 / 0.274 |
 | AutoGluon style: per series, steps pooled, absolute | 0.714 | 6.70 | 0.900 | 12.9 | 0.055 / 0.063 |
 | AutoETS native (statsforecast `level=`) | 0.872 | **5.93** | 0.944 | **9.9** | 0.015 / 0.015 |
 
-With W=12, the series option at 95% scores 12.9, against 16.2 for ABC×XYZ groups.
+With W=12 at 95%, the recommended default scores 11.7, against 16.2 for ABC×XYZ groups.
 Nixtla-style recovers at 80% (0.806 coverage, 6.43) but still under-covers at 95%
 (0.894).
+
+**Confirmation run** (run `324298550294595`; same seed and series). The extended
+notebook reproduced all 148 rows of the first run exactly, then added series shrinkage
+toward ABC×XYZ and a κ sweep:
+
+- **Shrinkage target:** shrinking toward ABC×XYZ beats shrinking toward Syntetos–Boylan
+  in **all 48** model × level × W × κ combinations. It also has a much smaller ABC
+  coverage gap (≈ 0.01 vs ≈ 0.04 at 95%).
+- **κ trade-off** (ABC×XYZ shrinkage, averaged over the 12 model × level × W
+  combinations):
+
+  | κ | Mean coverage gap vs nominal | MSIS vs κ=20 |
+  |---|---:|---:|
+  | 5 | −1.8 pt | −6.2% |
+  | **10** | **−1.3 pt** | **−3.8%** |
+  | 20 | −1.1 pt | 0 |
+  | 40 | −1.1 pt | +4.2% |
+
+  κ=10 buys about 4% sharper intervals for 0.2 points of coverage. κ=5 starts to
+  under-cover visibly at 95% (0.930–0.943). → **default `shrinkage_kappa: 10`**. Use 20
+  when coverage matters more than width.
 
 **Findings**
 
@@ -767,11 +792,14 @@ Nixtla-style recovers at 80% (0.806 coverage, 6.43) but still under-covers at 95
    own classes. Business columns (category, store) bring nothing over marginal. The
    differences are small, 1–7% MSIS. → **`group_col: auto` = ABC×XYZ.**
 2. **Coverage target:** per-series shrinkage counting *windows* is the best universal
-   method. It is near-nominal (0.775 / 0.944), and it beats the best grouping on MSIS
-   in all 12 model × level × W combinations. → **`coverage.target: series`** by default. `group` remains available when
-   a per-group guarantee is required.
+   method. It is near-nominal, and it beats the best grouping on MSIS in all 12 model ×
+   level × W combinations. Shrinking toward ABC×XYZ with κ=10 is the best variant
+   (confirmation run). → **`coverage.target: series`, `group_col: auto` (ABC×XYZ),
+   `shrinkage_kappa: 10`** by default. `group` remains available when a per-group
+   guarantee is required.
 3. **Normalisation is not enough.** At equal coverage, pooled methods have a much worse
-   interval score than native intervals (AutoETS at 95%: 16–17 vs 9.9). The seasonal-naive scale does
+   interval score than native intervals (AutoETS at 95%: 16–17 vs 9.9; the
+   recommended default narrows the gap to 13.9). The seasonal-naive scale does
    not size each series' interval well, and misses on spiky series are large and
    heavily penalised. This is why per-series adaptivity matters more than the choice of
    group.
@@ -790,9 +818,9 @@ Nixtla-style recovers at 80% (0.806 coverage, 6.43) but still under-covers at 95
   global or foundation models were tested.
 - There are no error bars on the metrics. The small gaps between groupings (1–7%)
   need a second seed or a bootstrap over series to confirm.
-- **The recommended combination is not yet tested.** The `series` runs shrank toward
-  Syntetos–Boylan groups, not ABC×XYZ. A run with ABC×XYZ shrinkage is the next step.
-- `κ = 20` was not tuned. Neither was CQR on native bands.
+- κ was tuned on the same test period it is reported on, so the κ=10 numbers are
+  slightly optimistic. Confirm on a second seed or dataset.
+- CQR on native bands was not tested. Neither was recency weighting.
 
 ---
 
@@ -819,10 +847,10 @@ infinitely wide intervals always cover.
 
 1. ~~Marginal vs per-series coverage? Which grouping column?~~ **Decided: configurable,
    chosen on M5** (§7.6.4). `coverage.target: series` (shrinkage with `λ = W/(W+κ)`)
-   by default, `group_col: auto` = ABC×XYZ, and `method: auto` (native first).
-   *Remaining:* confirm series shrinkage toward ABC×XYZ (only tested toward
-   Syntetos–Boylan), tune `shrinkage_kappa`, add a second seed or dataset
-   (`fresh_retail_net`), and test global and foundation models.
+   by default, `group_col: auto` = ABC×XYZ, `shrinkage_kappa: 10`, and `method: auto`
+   (native first). ABC×XYZ shrinkage and κ were confirmed in a second run.
+   *Remaining:* a second seed or dataset (`fresh_retail_net`), global and foundation
+   models, CQR on native bands, and recency weighting.
 2. ~~Output schema?~~ **Decided:** quantile map by default, with lo/hi columns
    available (`output_format: quantile_map | lo_hi | both`, §7.4).
    *Remaining:* whether the `fresh_retail_net` Genie views should use `both`.
