@@ -26,8 +26,10 @@ Branch: `docs/confidence-interval-spec`
   This was validated on M5 (§7.6.4).
 - **Native intervals, where a model has them, beat every conformal variant on interval
   score** at similar coverage in the M5 experiment (AutoETS: MSIS 9.9 vs ≥ 13.9 at
-  95%). Conformal calibration is the fallback for models without native intervals,
-  not a replacement for them.
+  95%). They are not calibrated, though: they over-cover by up to 12 points at 80%.
+  CQR on the native bands corrects that to nominal coverage at the same interval score,
+  even with 3 windows. Residual conformal calibration is the fallback for models
+  without native intervals.
 - What similar products ship is very consistent: a configurable coverage level
   (default 0.95 in BigQuery and Snowflake), or a list of quantiles (default
   P10/P50/P90 in Amazon, TimeGPT and Azure), returned as `lower`/`upper` columns next
@@ -458,8 +460,9 @@ below need no change to `backtest_length` or `stride`:
 
 This gives "model-native" bands. They are **not guaranteed calibrated**, and they are
 **missing for half of the zoo**. On M5 they were nonetheless the sharpest intervals at
-near-nominal coverage (§7.6.4). Native AutoETS over-covered at 80% (0.87), which CQR can
-tighten. MMF should still report their empirical coverage (§8).
+near-nominal coverage (§7.6.4). They do over-cover at 80%, however (AutoETS 0.87,
+SeasonalNaive 0.92), which CQR fixes (§7.2). MMF should still report their empirical
+coverage (§8).
 
 ### 7.2 Layer B: MMF conformal calibration (universal fallback)
 
@@ -480,8 +483,12 @@ and `actual` arrays), so there is **no extra training**:
 Scoring then produces `lo = ŷ + σ̂_i·q_lo` and `hi = ŷ + σ̂_i·q_hi`. After that, the
 lower bound is optionally clipped according to `clip_lower` (§7.3.1).
 
-For models with native quantiles, Layer B can instead run **CQR** on the native bands
-(§4.2), which keeps their adaptivity while fixing calibration.
+For models with native quantiles, Layer B runs **CQR** on the native bands instead
+(§4.2). This keeps their adaptivity while fixing their calibration. It requires the
+backtest to also store the native `lo`/`hi` arrays per window, which adds no extra
+training because the same fit produces them. On M5, `cqr_score: scaled` (score
+`|y − ŷ|` divided by the native half-width, pooled per ABC×XYZ group) reached nominal
+coverage with MSIS within 1% of native on average, even with W=3 (§7.6.4).
 
 ### 7.3 Configuration (proposal)
 
@@ -489,7 +496,8 @@ For models with native quantiles, Layer B can instead run **CQR** on the native 
 prediction_intervals:
   enabled: true
   levels: [80, 95]            # or quantiles: [0.1, 0.5, 0.9]
-  method: auto                # auto (native if available, else conformal) | conformal | native | cqr
+  method: auto                # auto (native + CQR if available, else conformal) | conformal | native | cqr
+  cqr_score: scaled           # scaled (nominal coverage) | asymmetric (sharper, over-covers), see §7.6.4
   coverage:                   # see §7.6
     target: series            # marginal | group | series
     group_col: auto           # auto = ABC×XYZ computed by MMF | sb_class | null | <column> | [col1, col2]
@@ -558,9 +566,9 @@ enabled.
 
 1. **P0**: Layer B with all three `coverage.target` values (default `series` with
    ABC×XYZ shrinkage), MMF-computed grouping columns (ABC, XYZ, Syntetos–Boylan),
-   interval metrics, and native pass-through for statsforecast (just `level=`). This is
-   model-agnostic and has no training cost.
-2. **P1**: Layer A for foundation models and Prophet, plus CQR.
+   interval metrics, and native pass-through plus CQR for statsforecast (`level=` in
+   backtest and forecast). This is model-agnostic and has no training cost.
+2. **P1**: Layer A for foundation models and Prophet, with CQR on their quantiles.
 3. **P2**: NeuralForecast probabilistic losses (`MQLoss`, `DistributionLoss`, NegBin),
    and LightGBM quantile objective.
 4. **P3**: probabilistic hierarchical reconciliation, and online ACI in a monitoring
@@ -806,6 +814,63 @@ Across the 232 matching rows, coverage differs between the seeds by 0.2 points o
 average, and by at most 1.0 point. The 1–7% MSIS gaps between groupings are therefore
 larger than the seed-to-seed noise.
 
+**CQR on native bands** (run `307705752027548`, seed 7, 31 min). Raw results:
+`pi_grouping_m5_results_cqr.json`. The native AutoETS and SeasonalNaive bands are
+refit on the same calibration windows, then corrected by a conformal quantile of their
+own misses (Romano et al., 2019). Both calibration and test clip the native lower bound
+at 0. Three scores were tested, each pooled over all series, per ABC×XYZ group, or per
+series shrunk toward ABC×XYZ (κ=10):
+
+- `sym`: one score `max(lo − y, y − hi)/σ` at `1−α`.
+- `asym`: one score per tail, `(lo − y)/σ` and `(y − hi)/σ`, each at `1−α/2`.
+- `scaled`: `|y − ŷ| / native half-width` at `1−α`, giving `ŷ ± q·half-width`. This
+  is normalised conformal with the native width as the local scale.
+
+Averaged over the 8 model × level × W combinations:
+
+| Variant | MSIS vs native | Worst case | Mean coverage gap vs nominal |
+|---|---:|---:|---:|
+| native (no correction) | 0 | 0 | +5.1 pt (SN 80%: +11.6, AutoETS 80%: +7.2) |
+| `sym`, any pool | −0.6 to −2.8% | 0% | +4.2 to +5.3 pt |
+| `asym`, series shrink κ=10 | **−7.3%** | −0.5% | +3.6 pt |
+| `asym`, ABC×XYZ | −5.7% | +0.5% | +3.5 pt |
+| **`scaled`, ABC×XYZ** | +0.6% | +8.7% | **−1.1 pt** |
+| `scaled`, marginal | +1.0% | +5.7% | −1.1 pt |
+
+Selected rows, at 95%, W=3:
+
+| | AutoETS coverage | AutoETS MSIS | SeasonalNaive coverage | SeasonalNaive MSIS |
+|---|---:|---:|---:|---:|
+| native | 0.944 | 9.94 | 0.972 | 11.34 |
+| `asym`, series κ=10 | 0.968 | 9.10 | 0.963 | 10.23 |
+| `scaled`, ABC×XYZ | 0.943 | 9.65 | 0.945 | 10.92 |
+| residual conformal default (`series`, ABC×XYZ, κ=10) | 0.941 | 13.92 | 0.946 | 16.33 |
+
+- **`sym` is close to a no-op.** On intermittent series, `y = 0` with a clipped
+  lower bound of 0 gives a score of 0 on most points, so the quantile barely moves.
+- **`asym` is the sharpest.** It beats native on MSIS in all 8 combinations, by 7% on
+  average and by up to 10% for SeasonalNaive. It over-covers by about 3.5 points,
+  however. Once the lower bound is clipped at 0, the lower tail almost never misses,
+  so the realised coverage tends toward `1−α/2`. A variant that gives the whole `α` to
+  the upper tail when the lower bound is 0 should fix this, but it is untested.
+- **`scaled` hits nominal coverage.** It turns native AutoETS's 0.87 at 80% into
+  0.78–0.79, and SeasonalNaive's 0.92 into 0.78. At 95%, its MSIS is 2–4% better than
+  native. At 80%, the narrower and correctly sized interval scores worse on MSIS (AutoETS
+  6.25 vs 5.93), because native over-coverage is cheap there.
+- **W=3 is enough.** Every variant gives nearly the same numbers at W=3 and W=12
+  (`scaled`, ABC×XYZ: +0.9% vs +0.3% MSIS). The native band already provides the
+  per-series, per-step shape, and CQR only estimates one correction per pool.
+- **Pooling matters little.** Shrinkage per series helps `asym` slightly. For `scaled`,
+  the ABC×XYZ pool is the best choice, and per-series shrinkage adds nothing.
+- CQR on native bands keeps a large lead over residual conformal: AutoETS 95% at W=3
+  scores 9.1–9.7, against 13.9 for the residual conformal default.
+
+→ **`method: auto` = native + CQR** for models with native bands, with
+`cqr_score: scaled` and the ABC×XYZ pool by default. That default is chosen for
+nominal coverage, which is the contract of `levels`. `cqr_score: asymmetric` is
+available when sharpness matters more than exact coverage. `method: native` keeps the
+uncorrected bands.
+
 **Findings**
 
 1. **Grouping column:** ABC×XYZ ranked first among all groupings in every one of the 12
@@ -824,8 +889,10 @@ larger than the seed-to-seed noise.
    not size each series' interval well, and misses on spiky series are large and
    heavily penalised. This is why per-series adaptivity matters more than the choice of
    group.
-4. **Native intervals first.** Where available (AutoETS, SeasonalNaive), native
-   intervals beat every conformal variant on MSIS. → `method: auto`.
+4. **Native intervals first, then CQR.** Where available (AutoETS, SeasonalNaive),
+   native intervals beat every residual conformal variant on MSIS, but over-cover by
+   up to 12 points at 80%. CQR with the `scaled` score brings them to nominal coverage
+   with about the same MSIS, even with W=3. → `method: auto` = native + CQR.
 5. **The product baselines fail as §6 predicts.** With W=3, Nixtla-style calibration
    collapses to the maximum of 3 errors (0.70 coverage at 95%). AutoGluon-style
    horizon pooling is sharp but under-covers by 5–9 points.
@@ -839,7 +906,9 @@ larger than the seed-to-seed noise.
   foundation models were tested. Two seeds (two different sets of series) agree.
 - κ was tuned on the same test period it is reported on. The second seed picks the
   same κ, but a second dataset or test period would be a stronger check.
-- CQR on native bands was not tested. Neither was recency weighting.
+- CQR was tested on seed 7 only, and only on statsforecast bands. Chronos and TimesFM
+  quantiles are the next candidates. The one-tailed `asym` variant (the whole `α` on
+  the upper tail when the lower bound is 0) is untested. So is recency weighting.
 
 ---
 
@@ -867,9 +936,10 @@ infinitely wide intervals always cover.
 1. ~~Marginal vs per-series coverage? Which grouping column?~~ **Decided: configurable,
    chosen on M5** (§7.6.4). `coverage.target: series` (shrinkage with `λ = W/(W+κ)`)
    by default, `group_col: auto` = ABC×XYZ, `shrinkage_kappa: 10`, and `method: auto`
-   (native first). ABC×XYZ shrinkage and κ were confirmed in a second run.
-   *Remaining:* a second seed or dataset (`fresh_retail_net`), global and foundation
-   models, CQR on native bands, and recency weighting.
+   (native + CQR `scaled` first). ABC×XYZ shrinkage and κ were confirmed in a second
+   run and on a second seed. *Remaining:* a second dataset (`fresh_retail_net`),
+   global and foundation models (including CQR on their quantiles), and recency
+   weighting.
 2. ~~Output schema?~~ **Decided:** quantile map by default, with lo/hi columns
    available (`output_format: quantile_map | lo_hi | both`, §7.4).
    *Remaining:* whether the `fresh_retail_net` Genie views should use `both`.

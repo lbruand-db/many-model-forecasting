@@ -9,7 +9,14 @@
 # MAGIC   (`W=3` mimics MMF defaults, `W=12` a long backtest),
 # MAGIC * evaluation on `TEST_WINDOWS` non-overlapping 28-day windows,
 # MAGIC * signed, scale-normalised scores (`(y - yhat) / sigma_i`, sigma = in-sample
-# MAGIC   seasonal-naive MAE), finite-sample conformal ranks, lower bound clipped at 0.
+# MAGIC   seasonal-naive MAE), finite-sample conformal ranks, lower bound clipped at 0,
+# MAGIC * CQR on the native bands of `NATIVE` models (Romano et al., 2019): the native
+# MAGIC   interval is refit on the same calibration windows (`native_cal`) and corrected by
+# MAGIC   a conformal quantile of its own misses. `cqr_sym` uses one score
+# MAGIC   `max(lo - y, y - hi) / sigma`, `cqr_asym` one score per tail at `1 - alpha/2`,
+# MAGIC   and `cqr_scaled` uses `|y - yhat| / half-width`. Each is pooled over all series,
+# MAGIC   ABC x XYZ groups, or per series shrunk toward ABC x XYZ with kappa=10. The
+# MAGIC   lower native bound is clipped at 0 in calibration and test alike.
 # MAGIC
 # MAGIC Results are returned with `dbutils.notebook.exit(json)`; nothing is written to tables.
 
@@ -183,8 +190,11 @@ def run_cv(pdf):
     test = sf.cross_validation(df=pdf, h=H, n_windows=TEST_WINDOWS, step_size=TEST_STEP)
     sf_nat = StatsForecast(models=make_models(NATIVE), freq="D", n_jobs=1)
     nat = sf_nat.cross_validation(df=pdf, h=H, n_windows=TEST_WINDOWS, step_size=TEST_STEP, level=LEVELS)
-    cal["kind"], test["kind"], nat["kind"] = "cal", "test", "native"
-    out = pd.concat([cal, test, nat], ignore_index=True)
+    # Native intervals on the calibration windows, for CQR on native bands.
+    nat_cal = sf_nat.cross_validation(df=pdf[pdf["ds"] <= test_cutoff], h=H, n_windows=W_LONG,
+                                      step_size=CAL_STEP, level=LEVELS)
+    cal["kind"], test["kind"], nat["kind"], nat_cal["kind"] = "cal", "test", "native", "native_cal"
+    out = pd.concat([cal, test, nat, nat_cal], ignore_index=True)
     out.columns = [c.replace("-", "_") for c in out.columns]
     for c in ("ds", "cutoff"):
         out[c] = pd.to_datetime(out[c]).dt.strftime("%Y-%m-%d")
@@ -221,6 +231,7 @@ for c in ("ds", "cutoff"):
 cal_cv = cv_all[cv_all["kind"] == "cal"]
 test_cv = cv_all[cv_all["kind"] == "test"]
 native_cv = cv_all[cv_all["kind"] == "native"]
+native_cal_cv = cv_all[cv_all["kind"] == "native_cal"]
 print(f"backtests done in {time.time() - t0:.0f}s ({len(cv_all)} rows)")
 
 cal_cutoffs = sorted(cal_cv["cutoff"].unique())
@@ -263,12 +274,15 @@ def abs_quantile(scores, level):
     return s[k - 1], inf
 
 
-def group_quantiles(E, labels, level):
-    """E: (N, W, H) normalised signed scores. Returns per-series (N, H) q_lo, q_hi, inf flags."""
-    W = E.shape[1]
+def merged_labels(labels, W):
     labels = pd.Series(labels)
     sizes = labels.map(labels.value_counts())
-    labels = labels.where(sizes * W >= MIN_SCORES_PER_GROUP, "__other__").to_numpy()
+    return labels.where(sizes * W >= MIN_SCORES_PER_GROUP, "__other__").to_numpy()
+
+
+def group_quantiles(E, labels, level):
+    """E: (N, W, H) normalised signed scores. Returns per-series (N, H) q_lo, q_hi, inf flags."""
+    labels = merged_labels(labels, E.shape[1])
     q_lo = np.empty((N, H))
     q_hi = np.empty((N, H))
     inf = np.zeros(N, dtype=bool)
@@ -277,6 +291,49 @@ def group_quantiles(E, labels, level):
         lo, hi, f = tail_quantiles(E[m].reshape(-1, H), level)
         q_lo[m], q_hi[m], inf[m] = lo, hi, f
     return q_lo, q_hi, inf
+
+
+def upper_q(S, labels, q, kappa=None):
+    """Upper conformal quantile at level q of scores S (N, W, H), returned as (N, H).
+
+    kappa=None pools each group per step (Mondrian). Otherwise the per-series quantile
+    (steps pooled) is shrunk toward the group with lambda = W/(W+kappa). The group step
+    profile is additive, because CQR scores can be negative or close to zero.
+    Also returns the share of series whose rank had to be clipped (infinite bound).
+    """
+    W = S.shape[1]
+    labels = merged_labels(labels, W)
+    out = np.empty((N, H))
+    q_all = np.empty(N)
+    inf = np.zeros(N, dtype=bool)
+    for g in np.unique(labels):
+        m = labels == g
+        n = m.sum() * W
+        k, inf[m] = conf_rank(n, q, upper=True)
+        out[m] = np.sort(S[m].reshape(-1, H), axis=0)[k - 1]
+        k_all, _ = conf_rank(n * H, q, upper=True)
+        q_all[m] = np.sort(S[m].reshape(-1))[k_all - 1]
+    if kappa is None:
+        return out, float(inf.mean())
+    k_s, _ = conf_rank(W * H, q, upper=True)
+    q_series = np.sort(S.reshape(N, -1), axis=1)[:, k_s - 1]
+    lam = W / (W + kappa)
+    return lam * (q_series[:, None] + out - q_all[:, None]) + (1 - lam) * out, float(inf.mean())
+
+
+def native_cube(df, col, cutoffs, fallback):
+    """Native band as an (N, K, H) cube; missing or failed fits fall back to the point forecast."""
+    c = to_cube(df, col, cutoffs)
+    bad = ~np.isfinite(c)
+    if bad.any():
+        print(f"{col}: {bad.mean():.4%} non-finite native bounds replaced by the point forecast")
+    return np.where(bad, fallback, c)
+
+
+def evaluate_cqr(name, model, W, level, lo, hi, inf_share):
+    """CQR corrections can be negative; uncross the bounds after clipping lo at 0."""
+    lo = np.maximum(lo, 0.0)
+    return evaluate(name, model, W, level, lo, np.maximum(hi, lo), yhat_test, inf_share)
 
 
 # COMMAND ----------
@@ -387,6 +444,50 @@ for model in MODELS:
             lo = to_cube(native_cv, f"{model}-lo-{level}", test_cutoffs)
             hi = to_cube(native_cv, f"{model}-hi-{level}", test_cutoffs)
             results.append(evaluate("baseline:native", model, 0, level, lo, hi, yhat_test))
+
+        # CQR on native bands (Romano et al., 2019): calibrate the native interval itself.
+        s3 = sigma[:, None, None]
+        pools = [("marginal", np.zeros(N, dtype=int), None),
+                 ("abc_xyz", F.loc[ids, "abc_xyz"].to_numpy(), None),
+                 ("series_abc_xyz_k10", F.loc[ids, "abc_xyz"].to_numpy(), 10)]
+        yhat_c_all = np.nan_to_num(yhat_cal_all)
+        for level in LEVELS:
+            a = 1 - level / 100
+            # The calibration and test bands are clipped the same way, so that the scores
+            # are computed against the bounds the corrections are applied to.
+            lo_c_all = np.maximum(native_cube(native_cal_cv, f"{model}-lo-{level}", cal_cutoffs, yhat_c_all), 0.0)
+            hi_c_all = native_cube(native_cal_cv, f"{model}-hi-{level}", cal_cutoffs, yhat_c_all)
+            lo_t = np.maximum(native_cube(native_cv, f"{model}-lo-{level}", test_cutoffs, yhat_test), 0.0)
+            hi_t = native_cube(native_cv, f"{model}-hi-{level}", test_cutoffs, yhat_test)
+            # Floor relative to the series scale, so a zero-width band cannot blow up the score.
+            half_t = np.maximum((hi_t - lo_t) / 2, 1e-3 * s3)
+            for W in W_LIST:
+                y_c = Y_cal[:, -W:, :]
+                yhat_c = yhat_c_all[:, -W:, :]
+                lo_c = lo_c_all[:, -W:, :]
+                hi_c = hi_c_all[:, -W:, :]
+                # Symmetric CQR: one score max(lo - y, y - hi), normalised by sigma.
+                S_sym = np.maximum(lo_c - y_c, y_c - hi_c) / s3
+                # Asymmetric CQR: one score per tail, each at 1 - alpha/2.
+                S_lo = (lo_c - y_c) / s3
+                S_hi = (y_c - hi_c) / s3
+                # Width-scaled: |y - yhat| / native half-width (normalised conformal with
+                # the native width as the local scale).
+                half_c = np.maximum((hi_c - lo_c) / 2, 1e-3 * s3)
+                S_scl = np.abs(y_c - yhat_c) / half_c
+                for pool_name, labels, kappa in pools:
+                    q, f = upper_q(S_sym, labels, 1 - a, kappa)
+                    results.append(evaluate_cqr(f"cqr_sym:{pool_name}", model, W, level,
+                                                lo_t - s3 * q[:, None, :], hi_t + s3 * q[:, None, :], f))
+                    q_lo, f_lo = upper_q(S_lo, labels, 1 - a / 2, kappa)
+                    q_hi, f_hi = upper_q(S_hi, labels, 1 - a / 2, kappa)
+                    results.append(evaluate_cqr(f"cqr_asym:{pool_name}", model, W, level,
+                                                lo_t - s3 * q_lo[:, None, :], hi_t + s3 * q_hi[:, None, :],
+                                                max(f_lo, f_hi)))
+                    q, f = upper_q(S_scl, labels, 1 - a, kappa)
+                    results.append(evaluate_cqr(f"cqr_scaled:{pool_name}", model, W, level,
+                                                yhat_test - q[:, None, :] * half_t,
+                                                yhat_test + q[:, None, :] * half_t, f))
     print(f"{model} evaluated at {time.time() - t0:.0f}s")
 
 R = pd.DataFrame(results)
