@@ -27,8 +27,9 @@ Branch: `docs/confidence-interval-spec`
 - **Native intervals, where a model has them, beat every conformal variant on interval
   score** at similar coverage in the M5 experiment (AutoETS: MSIS 9.9 vs ≥ 13.9 at
   95%). They are not calibrated, though: they over-cover by up to 12 points at 80%.
-  CQR on the native bands corrects that to nominal coverage at the same interval score,
-  even with 3 windows. Residual conformal calibration is the fallback for models
+  CQR on the native bands corrects that to nominal coverage, and improves the interval
+  score by 4% on average, even with 3 windows. That includes Chronos-Bolt, whose
+  clamped 95% band only covers 80%. Residual conformal calibration is the fallback for models
   without native intervals.
 - What similar products ship is very consistent: a configurable coverage level
   (default 0.95 in BigQuery and Snowflake), or a list of quantiles (default
@@ -454,7 +455,10 @@ below need no change to `backtest_length` or `stride`:
 - statsforecast: call `predict(h, level=levels)` for models whose native PI is
   available (§3.1).
 - Chronos / TimesFM: keep the quantile tensor, mapping levels to the nearest trained
-  quantiles. For TimesFM, enable `use_continuous_quantile_head`.
+  quantiles. For TimesFM, enable `use_continuous_quantile_head`. Chronos-Bolt only
+  has quantiles 0.1–0.9 and silently clamps anything wider. Its "95%" band is
+  therefore its 80% band: on M5 it covered 0.80. Wider levels must go through CQR,
+  and MMF should log a warning (§7.6.4).
 - Moirai: take `np.quantile(samples, τ)` and raise the default `num_samples` (≥100).
 - Prophet: `predict_interval`.
 
@@ -489,9 +493,12 @@ backtest to also store the native `lo`/`hi` arrays per window, which adds no ext
 training because the same fit produces them. The default, `cqr_score: asymmetric`
 with an adaptive tail split, uses one score per tail. Whatever share of `α` the lower
 tail does not use (it rarely misses once clipped at 0) goes to the upper tail. The
-correction is pooled in the same way as `coverage` (per series, shrunk toward
-ABC×XYZ). On M5 it reached nominal coverage within 1 point and improved MSIS by
-2–3% over native, even with W=3, on two seeds (§7.6.4).
+correction is pooled per `group_col` group (ABC×XYZ by default, `cqr_pool: group`).
+On M5, with W=3 or more, it reached nominal coverage within 2 points on the four
+models with native bands (AutoETS, SeasonalNaive, Chronos-Bolt, Chronos-2), and
+improved MSIS by 4% on average (§7.6.4). Per-series shrinkage is slightly sharper
+for the statsforecast models. It fails, however, when the native band is far off
+(Chronos-Bolt at 95%), so it is not the default for CQR.
 
 ### 7.3 Configuration (proposal)
 
@@ -502,6 +509,7 @@ prediction_intervals:
   method: auto                # auto (native + CQR if available, else conformal) | conformal | native | cqr
   cqr_score: asymmetric       # asymmetric | scaled | symmetric, see §7.6.4
   cqr_tail_split: adaptive    # adaptive (unused lower-tail alpha goes to the upper tail) | equal (alpha/2 each; over-covers when clipped)
+  cqr_pool: group             # group (per coverage.group_col) | marginal | series (shrinkage as in coverage), see §7.6.4
   coverage:                   # see §7.6
     target: series            # marginal | group | series
     group_col: auto           # auto = ABC×XYZ computed by MMF | sb_class | null | <column> | [col1, col2]
@@ -890,16 +898,73 @@ is calibrated at `1 − α + m_lo` (capped at `1 − α/2`). The seed-7 run repr
 - At 95% it beats native on MSIS in every combination (−1.4% to −8.8%). At 80% it
   costs MSIS for AutoETS (+5 to +7%), as every nominal variant does: native AutoETS
   over-covers there (0.87), which MSIS barely penalises.
-- Per-series shrinkage helps `asym_1t` more than it helps `scaled`, and the pool is the
-  same as `coverage.target: series`. The CQR correction can therefore reuse the
-  `coverage` block, and needs no separate pooling setting.
+- Per-series shrinkage helps `asym_1t` more than it helps `scaled`, on these two
+  models. The Chronos run below shows it does not generalise.
 - Seeds 7 and 42 agree on the ranking and on the coverage figures to within 0.1 point.
 
+**CQR on Chronos quantiles** (run `252308978398800`,
+seed 7, same 4,966 series, 84 min; raw results in `pi_grouping_m5_results_chronos.json`).
+Chronos-Bolt-small and Chronos-2 were run zero-shot on CPU, on the driver, with a
+512-day context. Their 2.5/10/50/90/97.5% quantiles serve as the native band, and the
+median as the point forecast. Every method above was applied to them unchanged. The
+SeasonalNaive rows reproduce the earlier seed-7 run exactly.
+
+Native bands:
+
+| Model | Coverage 80% | MSIS 80% | Coverage 95% | MSIS 95% | Series under-covered by >10 pt at 95% |
+|---|---:|---:|---:|---:|---:|
+| AutoETS (for reference) | 0.872 | 5.93 | 0.944 | 9.94 | 4.5% |
+| Chronos-2 | 0.783 | 5.90 | 0.966 | 9.95 | 2.4% |
+| Chronos-Bolt-small | 0.797 | 6.04 | **0.800** | **15.05** | **61.8%** |
+
+Chronos-2 is as sharp as AutoETS and close to calibrated. Chronos-Bolt's 95% band is
+just its 80% band, because the model clamps to its trained 0.1–0.9 quantiles.
+
+`asym_1t` CQR, W=3, by pool:
+
+| | Chronos-2 95% | Chronos-Bolt 80% | Chronos-Bolt 95% |
+|---|---|---|---|
+| native | 0.966 / 9.95 | 0.797 / 6.04 | 0.800 / 15.05 |
+| **ABC×XYZ group** | 0.960 / 9.99 | 0.815 / 6.03 | **0.943 / 10.65** |
+| series, κ=10 | 0.958 / 10.06 | 0.775 / 5.98 | **0.877** / 10.25 |
+
+(coverage / MSIS)
+
+Across the four models with native bands (AutoETS, SeasonalNaive, Chronos-Bolt and
+Chronos-2), × 2 levels × W ∈ {3, 12}:
+
+| CQR pool (`asym_1t`) | MSIS vs native | Mean coverage gap | Worst coverage gap | Series under-covered by >10 pt |
+|---|---:|---:|---:|---:|
+| **ABC×XYZ group** | **−4.1%** | **+0.3 pt** | **1.8 pt** | **9.9%** |
+| marginal | −3.3% | −0.4 pt | 2.5 pt | 12.8% |
+| series, κ=10 | −5.3% | −1.7 pt | **9.3 pt** | 15.5% |
+| `scaled`, ABC×XYZ | +3.5% | −1.2 pt | 2.6 pt | 11.1% |
+| residual conformal (`series`, ABC×XYZ, κ=10) | +15.6% | −1.5 pt | 2.9 pt | 17.3% |
+
+- **CQR fixes Chronos-Bolt's broken 95% band.** With the ABC×XYZ pool, coverage goes
+  from 0.80 to 0.94–0.95, MSIS from 15.0 to 10.7 (−29%), and the share of badly
+  under-covered series from 62% to 8%. Even W=3 is enough.
+- **Per-series shrinkage fails when the needed correction is large.** For
+  Chronos-Bolt at 95% it stays at 0.86–0.88, even at W=12. The per-series 97.5%
+  quantile is estimated from 3 to 12 windows of strongly correlated steps, so it is
+  biased low. For the statsforecast models the correction is small, so the bias did
+  not show.
+- **CQR does no harm on an already good band.** For Chronos-2 the ABC×XYZ pool changes
+  MSIS by +0.2% and coverage by at most 1.8 points. At 80% it halves the share of
+  badly under-covered series, from 24% to 12%.
+- `cqr_score: scaled` with per-series shrinkage blows up on Chronos (MSIS up to 370 at
+  95%, W=12). Some native half-widths are near zero, and the 1e-3·σ floor is too low.
+  Do not offer that combination.
+- Residual conformal on the Chronos median is again far behind native + CQR (+21%
+  MSIS for Chronos-2).
+
 → **`method: auto` = native + CQR** for models with native bands, with
-`cqr_score: asymmetric`, `cqr_tail_split: adaptive`, and the `coverage` pooling
-(per-series, shrunk toward ABC×XYZ with κ=10) by default. `cqr_tail_split: equal`
-gives sharper but over-covering bands. `cqr_score: scaled` is a simpler alternative
-with nearly the same calibration. `method: native` keeps the uncorrected bands.
+`cqr_score: asymmetric`, `cqr_tail_split: adaptive`, and **`cqr_pool: group`**
+(ABC×XYZ by default) as the defaults. `cqr_pool: series` is about 1–2% sharper on
+well-specified bands (statsforecast). It under-covers when the native band is badly
+miscalibrated, though, and that is exactly the case CQR is for.
+`cqr_tail_split: equal` gives sharper but over-covering bands. `method: native` keeps
+the uncorrected bands.
 
 **Findings**
 
@@ -921,8 +986,10 @@ with nearly the same calibration. `method: native` keeps the uncorrected bands.
    group.
 4. **Native intervals first, then CQR.** Where available (AutoETS, SeasonalNaive),
    native intervals beat every residual conformal variant on MSIS, but over-cover by
-   up to 12 points at 80%. One-tailed asymmetric CQR brings them within 1 point of
-   nominal coverage and still improves MSIS by 2–3%, even with W=3.
+   up to 12 points at 80% (Chronos-Bolt under-covers by 15 points at 95%).
+   One-tailed asymmetric CQR, pooled per ABC×XYZ group, brings all four models
+   within 2 points of nominal coverage, and improves MSIS by 4% on average, even
+   with W=3.
    → `method: auto` = native + CQR.
 5. **The product baselines fail as §6 predicts.** With W=3, Nixtla-style calibration
    collapses to the maximum of 3 errors (0.70 coverage at 95%). AutoGluon-style
@@ -937,8 +1004,9 @@ with nearly the same calibration. `method: native` keeps the uncorrected bands.
   foundation models were tested. Two seeds (two different sets of series) agree.
 - κ was tuned on the same test period it is reported on. The second seed picks the
   same κ, but a second dataset or test period would be a stronger check.
-- CQR was tested only on statsforecast bands, on two seeds. Chronos and TimesFM
-  quantiles are the next candidates. Recency weighting is untested.
+- CQR was tested on statsforecast bands (two seeds) and Chronos bands (one seed).
+  TimesFM, Moirai and global models (NeuralForecast, LightGBM) are untested. So is
+  recency weighting.
 
 ---
 
@@ -966,10 +1034,10 @@ infinitely wide intervals always cover.
 1. ~~Marginal vs per-series coverage? Which grouping column?~~ **Decided: configurable,
    chosen on M5** (§7.6.4). `coverage.target: series` (shrinkage with `λ = W/(W+κ)`)
    by default, `group_col: auto` = ABC×XYZ, `shrinkage_kappa: 10`, and `method: auto`
-   (native + one-tailed asymmetric CQR first). ABC×XYZ shrinkage and κ were confirmed in a second
-   run and on a second seed. *Remaining:* a second dataset (`fresh_retail_net`),
-   global and foundation models (including CQR on their quantiles), and recency
-   weighting.
+   (native + one-tailed asymmetric CQR pooled per ABC×XYZ group first). ABC×XYZ
+   shrinkage and κ were confirmed in a second run and on a second seed. CQR was
+   tested on Chronos-Bolt and Chronos-2. *Remaining:* a second dataset
+   (`fresh_retail_net`), TimesFM and global models, and recency weighting.
 2. ~~Output schema?~~ **Decided:** quantile map by default, with lo/hi columns
    available (`output_format: quantile_map | lo_hi | both`, §7.4).
    *Remaining:* whether the `fresh_retail_net` Genie views should use `both`.

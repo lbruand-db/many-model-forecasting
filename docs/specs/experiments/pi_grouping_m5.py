@@ -23,7 +23,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install statsforecast==2.0.0 datasetsforecast==0.0.8 --quiet
+# MAGIC %pip install statsforecast==2.0.0 datasetsforecast==0.0.8 chronos-forecasting==2.2.2 --quiet
 
 # COMMAND ----------
 
@@ -43,8 +43,12 @@ from statsforecast.models import AutoETS, CrostonSBA, SeasonalNaive
 
 dbutils.widgets.text("n_series", "2000")
 dbutils.widgets.text("seed", "7")
+dbutils.widgets.text("models", "SeasonalNaive,CrostonSBA,AutoETS")
+dbutils.widgets.text("foundation", "")   # e.g. "ChronosBoltSmall,Chronos2"
 N_SERIES = int(dbutils.widgets.get("n_series"))
 SEED = int(dbutils.widgets.get("seed"))
+STATS_MODELS = [m for m in dbutils.widgets.get("models").split(",") if m]
+FOUNDATION = [m for m in dbutils.widgets.get("foundation").split(",") if m]
 
 H = 28                 # forecast horizon (M5)
 CAL_STEP = 14          # stride between calibration windows
@@ -162,11 +166,18 @@ sigma = F.loc[ids, "sigma"].to_numpy()
 
 # COMMAND ----------
 
-MODELS = ["SeasonalNaive", "CrostonSBA", "AutoETS"]
-NATIVE = ["SeasonalNaive", "AutoETS"]
+# statsforecast models are refit per window. Foundation models are zero-shot: their
+# quantiles on each window are the native band, and their median is the point forecast.
+STATS_NATIVE = [m for m in STATS_MODELS if m in ("SeasonalNaive", "AutoETS")]
+MODELS = STATS_MODELS + FOUNDATION
+NATIVE = STATS_NATIVE + FOUNDATION
+FOUNDATION_REPOS = {"ChronosBoltSmall": "amazon/chronos-bolt-small", "Chronos2": "amazon/chronos-2"}
+CONTEXT = 512          # foundation-model context length (days)
+FM_BATCH = 64
 N_CHUNKS = 64
-NATIVE_COLS = [f"{m}_{side}_{lv}" for m in NATIVE for side in ("lo", "hi") for lv in LEVELS]
-OUT_COLS = ["unique_id", "ds", "cutoff", "kind", "y"] + MODELS + NATIVE_COLS
+# Columns returned by the Spark backtest UDF (statsforecast only; foundation models run on the driver).
+NATIVE_COLS = [f"{m}_{side}_{lv}" for m in STATS_NATIVE for side in ("lo", "hi") for lv in LEVELS]
+OUT_COLS = ["unique_id", "ds", "cutoff", "kind", "y"] + STATS_MODELS + NATIVE_COLS
 
 
 def make_models(names):
@@ -186,20 +197,56 @@ def run_cv(pdf):
     """
     pdf = pdf.drop(columns="chunk")
     pdf["ds"] = pd.to_datetime(pdf["ds"])
-    sf = StatsForecast(models=make_models(MODELS), freq="D", n_jobs=1)
+    sf = StatsForecast(models=make_models(STATS_MODELS), freq="D", n_jobs=1)
     cal = sf.cross_validation(df=pdf[pdf["ds"] <= test_cutoff], h=H, n_windows=W_LONG, step_size=CAL_STEP)
     test = sf.cross_validation(df=pdf, h=H, n_windows=TEST_WINDOWS, step_size=TEST_STEP)
-    sf_nat = StatsForecast(models=make_models(NATIVE), freq="D", n_jobs=1)
-    nat = sf_nat.cross_validation(df=pdf, h=H, n_windows=TEST_WINDOWS, step_size=TEST_STEP, level=LEVELS)
-    # Native intervals on the calibration windows, for CQR on native bands.
-    nat_cal = sf_nat.cross_validation(df=pdf[pdf["ds"] <= test_cutoff], h=H, n_windows=W_LONG,
-                                      step_size=CAL_STEP, level=LEVELS)
+    if STATS_NATIVE:
+        sf_nat = StatsForecast(models=make_models(STATS_NATIVE), freq="D", n_jobs=1)
+        nat = sf_nat.cross_validation(df=pdf, h=H, n_windows=TEST_WINDOWS, step_size=TEST_STEP, level=LEVELS)
+        # Native intervals on the calibration windows, for CQR on native bands.
+        nat_cal = sf_nat.cross_validation(df=pdf[pdf["ds"] <= test_cutoff], h=H, n_windows=W_LONG,
+                                          step_size=CAL_STEP, level=LEVELS)
+    else:
+        nat, nat_cal = test[["unique_id", "ds", "cutoff", "y"]].copy(), cal[["unique_id", "ds", "cutoff", "y"]].copy()
     cal["kind"], test["kind"], nat["kind"], nat_cal["kind"] = "cal", "test", "native", "native_cal"
     out = pd.concat([cal, test, nat, nat_cal], ignore_index=True)
     out.columns = [c.replace("-", "_") for c in out.columns]
     for c in ("ds", "cutoff"):
         out[c] = pd.to_datetime(out[c]).dt.strftime("%Y-%m-%d")
     return out.reindex(columns=OUT_COLS)
+
+
+def foundation_cv(pipe, name, pdf, frame):
+    """Zero-shot quantile forecasts for every (series, cutoff) of a cross_validation frame.
+
+    Runs on the driver, like MMF's serverless path: Spark Connect workers on serverless
+    have little memory per Python worker and a read-only home for the Hugging Face cache.
+    Returns unique_id, ds, cutoff, <name> (median) and <name>-lo/hi-<level> columns.
+    Chronos-Bolt was trained on quantiles 0.1-0.9 only and clamps the 95% band to them.
+    """
+    import torch
+
+    levels = sorted(LEVELS)
+    qs = [(100 - lv) / 200 for lv in reversed(levels)] + [0.5] + [1 - (100 - lv) / 200 for lv in levels]
+    series = {u: g.sort_values("ds") for u, g in pdf.groupby("unique_id")}
+    pairs = frame[["unique_id", "cutoff"]].drop_duplicates().to_numpy()
+    ctx = []
+    for u, c in pairs:
+        g = series[u]
+        ctx.append(torch.tensor(g.loc[g["ds"] <= c, "y"].to_numpy(dtype="float32")[-CONTEXT:]))
+    out = []
+    for b in range(0, len(ctx), FM_BATCH):
+        q, _ = pipe.predict_quantiles(ctx[b:b + FM_BATCH], prediction_length=H, quantile_levels=qs)
+        if isinstance(q, list):                 # Chronos-2: one (n_variates, H, Q) tensor per series
+            q = torch.stack([x[0] for x in q])
+        out.append(q.numpy())
+    q = np.concatenate(out)                     # (len(pairs), H, Q)
+    cols = ([f"{name}-lo-{lv}" for lv in reversed(levels)] + [name] + [f"{name}-hi-{lv}" for lv in levels])
+    rows = pd.DataFrame(np.repeat(pairs, H, axis=0), columns=["unique_id", "cutoff"])
+    rows["cutoff"] = pd.to_datetime(rows["cutoff"])
+    rows["ds"] = rows["cutoff"] + pd.to_timedelta(np.tile(np.arange(1, H + 1), len(pairs)), unit="D")
+    rows[cols] = q.reshape(-1, len(qs))
+    return rows
 
 
 def to_cube(cv, col, cutoffs):
@@ -234,6 +281,29 @@ test_cv = cv_all[cv_all["kind"] == "test"]
 native_cv = cv_all[cv_all["kind"] == "native"]
 native_cal_cv = cv_all[cv_all["kind"] == "native_cal"]
 print(f"backtests done in {time.time() - t0:.0f}s ({len(cv_all)} rows)")
+
+if FOUNDATION:
+    import gc
+    import os
+    import tempfile
+
+    os.environ.setdefault("HF_HOME", os.path.join(tempfile.gettempdir(), "hf"))
+    import torch
+    from chronos import BaseChronosPipeline
+
+    on = ["unique_id", "ds", "cutoff"]
+    for name in FOUNDATION:
+        pipe = BaseChronosPipeline.from_pretrained(FOUNDATION_REPOS[name], device_map="cpu", dtype=torch.float32)
+        with torch.inference_mode():
+            fm_cal = foundation_cv(pipe, name, Y, cal_cv)
+            fm_test = foundation_cv(pipe, name, Y, test_cv)
+        del pipe
+        gc.collect()
+        cal_cv = cal_cv.merge(fm_cal[on + [name]], on=on, how="left")
+        test_cv = test_cv.merge(fm_test[on + [name]], on=on, how="left")
+        native_cal_cv = native_cal_cv.merge(fm_cal, on=on, how="left")
+        native_cv = native_cv.merge(fm_test, on=on, how="left")
+        print(f"{name} done in {time.time() - t0:.0f}s")
 
 cal_cutoffs = sorted(cal_cv["cutoff"].unique())
 test_cutoffs = sorted(test_cv["cutoff"].unique())
