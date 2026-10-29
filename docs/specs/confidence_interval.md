@@ -486,9 +486,12 @@ lower bound is optionally clipped according to `clip_lower` (§7.3.1).
 For models with native quantiles, Layer B runs **CQR** on the native bands instead
 (§4.2). This keeps their adaptivity while fixing their calibration. It requires the
 backtest to also store the native `lo`/`hi` arrays per window, which adds no extra
-training because the same fit produces them. On M5, `cqr_score: scaled` (score
-`|y − ŷ|` divided by the native half-width, pooled per ABC×XYZ group) reached nominal
-coverage with MSIS within 1% of native on average, even with W=3 (§7.6.4).
+training because the same fit produces them. The default, `cqr_score: asymmetric`
+with an adaptive tail split, uses one score per tail. Whatever share of `α` the lower
+tail does not use (it rarely misses once clipped at 0) goes to the upper tail. The
+correction is pooled in the same way as `coverage` (per series, shrunk toward
+ABC×XYZ). On M5 it reached nominal coverage within 1 point and improved MSIS by
+2–3% over native, even with W=3, on two seeds (§7.6.4).
 
 ### 7.3 Configuration (proposal)
 
@@ -497,7 +500,8 @@ prediction_intervals:
   enabled: true
   levels: [80, 95]            # or quantiles: [0.1, 0.5, 0.9]
   method: auto                # auto (native + CQR if available, else conformal) | conformal | native | cqr
-  cqr_score: scaled           # scaled (nominal coverage) | asymmetric (sharper, over-covers), see §7.6.4
+  cqr_score: asymmetric       # asymmetric | scaled | symmetric, see §7.6.4
+  cqr_tail_split: adaptive    # adaptive (unused lower-tail alpha goes to the upper tail) | equal (alpha/2 each; over-covers when clipped)
   coverage:                   # see §7.6
     target: series            # marginal | group | series
     group_col: auto           # auto = ABC×XYZ computed by MMF | sb_class | null | <column> | [col1, col2]
@@ -851,8 +855,8 @@ Selected rows, at 95%, W=3:
 - **`asym` is the sharpest.** It beats native on MSIS in all 8 combinations, by 7% on
   average and by up to 10% for SeasonalNaive. It over-covers by about 3.5 points,
   however. Once the lower bound is clipped at 0, the lower tail almost never misses,
-  so the realised coverage tends toward `1−α/2`. A variant that gives the whole `α` to
-  the upper tail when the lower bound is 0 should fix this, but it is untested.
+  so the realised coverage tends toward `1−α/2`. The one-tailed variant below fixes
+  this.
 - **`scaled` hits nominal coverage.** It turns native AutoETS's 0.87 at 80% into
   0.78–0.79, and SeasonalNaive's 0.92 into 0.78. At 95%, its MSIS is 2–4% better than
   native. At 80%, the narrower and correctly sized interval scores worse on MSIS (AutoETS
@@ -865,11 +869,37 @@ Selected rows, at 95%, W=3:
 - CQR on native bands keeps a large lead over residual conformal: AutoETS 95% at W=3
   scores 9.1–9.7, against 13.9 for the residual conformal default.
 
+**One-tailed asymmetric CQR, on two seeds** (runs `154621151140624` with seed 7 and
+`650019621875992` with seed 42; raw results in `pi_grouping_m5_results_cqr_1t_seed7.json`
+and `..._seed42.json`). The lower correction is computed as in `asym`. The lower tail
+then gets its realised miss rate `m_lo` on the calibration windows, and the upper tail
+is calibrated at `1 − α + m_lo` (capped at `1 − α/2`). The seed-7 run reproduced all
+304 earlier rows exactly. Averaged over the 8 model × level × W combinations:
+
+| Variant | MSIS vs native, seed 7 / 42 | Mean coverage gap, seed 7 / 42 | Worst coverage gap |
+|---|---:|---:|---:|
+| `asym` (equal split), series κ=10 | −7.3% / −8.1% | +3.6 / +3.7 pt | 6.5 pt |
+| **`asym_1t`, series κ=10** | **−2.4% / −3.4%** | **−0.4 / −0.4 pt** | **1.0 pt** |
+| `asym_1t`, ABC×XYZ | −0.9% / −0.9% | −0.4 / −0.4 pt | 1.2 pt |
+| `scaled`, ABC×XYZ | +0.6% / −0.5% | −1.1 / −1.1 pt | 2.1 pt |
+
+- **`asym_1t` with per-series shrinkage is the best calibrated variant.** It is never
+  more than 1 point from nominal. Its MSIS beats `scaled` (ABC×XYZ) by about 3% on
+  average on both seeds, and in 7 and 6 of the 8 combinations. Fewer series are
+  under-covered by more than 10 points: 9.9% against about 11.8%.
+- At 95% it beats native on MSIS in every combination (−1.4% to −8.8%). At 80% it
+  costs MSIS for AutoETS (+5 to +7%), as every nominal variant does: native AutoETS
+  over-covers there (0.87), which MSIS barely penalises.
+- Per-series shrinkage helps `asym_1t` more than it helps `scaled`, and the pool is the
+  same as `coverage.target: series`. The CQR correction can therefore reuse the
+  `coverage` block, and needs no separate pooling setting.
+- Seeds 7 and 42 agree on the ranking and on the coverage figures to within 0.1 point.
+
 → **`method: auto` = native + CQR** for models with native bands, with
-`cqr_score: scaled` and the ABC×XYZ pool by default. That default is chosen for
-nominal coverage, which is the contract of `levels`. `cqr_score: asymmetric` is
-available when sharpness matters more than exact coverage. `method: native` keeps the
-uncorrected bands.
+`cqr_score: asymmetric`, `cqr_tail_split: adaptive`, and the `coverage` pooling
+(per-series, shrunk toward ABC×XYZ with κ=10) by default. `cqr_tail_split: equal`
+gives sharper but over-covering bands. `cqr_score: scaled` is a simpler alternative
+with nearly the same calibration. `method: native` keeps the uncorrected bands.
 
 **Findings**
 
@@ -891,8 +921,9 @@ uncorrected bands.
    group.
 4. **Native intervals first, then CQR.** Where available (AutoETS, SeasonalNaive),
    native intervals beat every residual conformal variant on MSIS, but over-cover by
-   up to 12 points at 80%. CQR with the `scaled` score brings them to nominal coverage
-   with about the same MSIS, even with W=3. → `method: auto` = native + CQR.
+   up to 12 points at 80%. One-tailed asymmetric CQR brings them within 1 point of
+   nominal coverage and still improves MSIS by 2–3%, even with W=3.
+   → `method: auto` = native + CQR.
 5. **The product baselines fail as §6 predicts.** With W=3, Nixtla-style calibration
    collapses to the maximum of 3 errors (0.70 coverage at 95%). AutoGluon-style
    horizon pooling is sharp but under-covers by 5–9 points.
@@ -906,9 +937,8 @@ uncorrected bands.
   foundation models were tested. Two seeds (two different sets of series) agree.
 - κ was tuned on the same test period it is reported on. The second seed picks the
   same κ, but a second dataset or test period would be a stronger check.
-- CQR was tested on seed 7 only, and only on statsforecast bands. Chronos and TimesFM
-  quantiles are the next candidates. The one-tailed `asym` variant (the whole `α` on
-  the upper tail when the lower bound is 0) is untested. So is recency weighting.
+- CQR was tested only on statsforecast bands, on two seeds. Chronos and TimesFM
+  quantiles are the next candidates. Recency weighting is untested.
 
 ---
 
@@ -936,7 +966,7 @@ infinitely wide intervals always cover.
 1. ~~Marginal vs per-series coverage? Which grouping column?~~ **Decided: configurable,
    chosen on M5** (§7.6.4). `coverage.target: series` (shrinkage with `λ = W/(W+κ)`)
    by default, `group_col: auto` = ABC×XYZ, `shrinkage_kappa: 10`, and `method: auto`
-   (native + CQR `scaled` first). ABC×XYZ shrinkage and κ were confirmed in a second
+   (native + one-tailed asymmetric CQR first). ABC×XYZ shrinkage and κ were confirmed in a second
    run and on a second seed. *Remaining:* a second dataset (`fresh_retail_net`),
    global and foundation models (including CQR on their quantiles), and recency
    weighting.

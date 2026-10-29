@@ -13,7 +13,8 @@
 # MAGIC * CQR on the native bands of `NATIVE` models (Romano et al., 2019): the native
 # MAGIC   interval is refit on the same calibration windows (`native_cal`) and corrected by
 # MAGIC   a conformal quantile of its own misses. `cqr_sym` uses one score
-# MAGIC   `max(lo - y, y - hi) / sigma`, `cqr_asym` one score per tail at `1 - alpha/2`,
+# MAGIC   `max(lo - y, y - hi) / sigma`, `cqr_asym` one score per tail at `1 - alpha/2`
+# MAGIC   (`cqr_asym_1t` gives the upper tail the alpha the clipped lower tail leaves unused),
 # MAGIC   and `cqr_scaled` uses `|y - yhat| / half-width`. Each is pooled over all series,
 # MAGIC   ABC x XYZ groups, or per series shrunk toward ABC x XYZ with kappa=10. The
 # MAGIC   lower native bound is clipped at 0 in calibration and test alike.
@@ -484,6 +485,14 @@ for model in MODELS:
                     results.append(evaluate_cqr(f"cqr_asym:{pool_name}", model, W, level,
                                                 lo_t - s3 * q_lo[:, None, :], hi_t + s3 * q_hi[:, None, :],
                                                 max(f_lo, f_hi)))
+                    # One-tailed asymmetric: with lo clipped at 0 the lower tail rarely
+                    # misses, so the upper tail gets the alpha it leaves unused. m_lo is the
+                    # lower miss rate of the corrected band on the calibration windows.
+                    m_lo = float(np.mean(S_lo > q_lo[:, None, :]))
+                    q_hi1, f_hi1 = upper_q(S_hi, labels, min(1 - a + m_lo, 1 - a / 2), kappa)
+                    results.append(evaluate_cqr(f"cqr_asym_1t:{pool_name}", model, W, level,
+                                                lo_t - s3 * q_lo[:, None, :], hi_t + s3 * q_hi1[:, None, :],
+                                                max(f_lo, f_hi1)))
                     q, f = upper_q(S_scl, labels, 1 - a, kappa)
                     results.append(evaluate_cqr(f"cqr_scaled:{pool_name}", model, W, level,
                                                 yhat_test - q[:, None, :] * half_t,
