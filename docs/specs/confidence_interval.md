@@ -88,7 +88,8 @@ What each pipeline already computes and discards:
 
 Also relevant: local models apply `fillna(0)` and `clip(0)` to the target
 (`Forecaster.py:343`, `StatsFcForecastingPipeline.py:37`). The lower bound of an
-interval should be clipped to 0 the same way for non-negative targets.
+interval should be clipped to 0 the same way for non-negative targets. This is made
+configurable via `clip_lower` (§7.3.1).
 
 ---
 
@@ -432,7 +433,8 @@ and `actual` arrays), so there is **no extra training**:
 5. Persist the result to a new table `calibration_output` (`run_id`, `model`, `pool`,
    `step`, `level`, `q_lo`, `q_hi`, `n_scores`).
 
-Scoring then produces `lo = clip(ŷ + σ̂_i·q_lo, 0)` and `hi = ŷ + σ̂_i·q_hi`.
+Scoring then produces `lo = ŷ + σ̂_i·q_lo` and `hi = ŷ + σ̂_i·q_hi`. After that, the
+lower bound is optionally clipped according to `clip_lower` (§7.3.1).
 
 For models with native quantiles, Layer B can instead run **CQR** on the native bands
 (§4.2), which keeps their adaptivity while fixing calibration.
@@ -448,8 +450,41 @@ prediction_intervals:
   segment_col: null           # e.g. "intermittency_class"
   score: signed_normalized    # abs | signed | signed_normalized
   recency_decay: null         # e.g. 0.9 per window (weighted conformal)
-  clip_lower: 0
+  clip_lower: auto            # auto | none | <number>, see §7.3.1
 ```
+
+#### 7.3.1 Lower-bound clipping (`clip_lower`)
+
+Residual-based intervals are symmetric or nearly so around `ŷ`. For small `ŷ`
+(low-volume or intermittent series), `ŷ − margin` easily falls below the physically
+possible minimum. Example: a Croston forecast of 0.3 with a margin of 2 gives
+`[-1.7, 2.3]`.
+
+| Value | Behaviour | When to use |
+|---|---|---|
+| `auto` (default) | Clip at 0 **only if** the training target has `min(y) ≥ 0` across all series. The decision is made once per run and logged to MLflow as the tag `pi_clip_lower`. | Most users. It does the right thing for demand/sales and leaves signed targets alone. |
+| `none` | Never clip. | Targets that can be negative: profit/loss, temperature, returns, net flows, differenced series. |
+| `<number>` (e.g. `0`) | Always clip: `lo = max(lo, clip_lower)`. | A known physical floor (0 for counts, a contractual minimum, etc.). |
+
+Notes:
+- **Coverage is preserved.** If `y ≥ c` always holds, then `y ∈ [lo, hi]` exactly when
+  `y ∈ [max(lo, c), hi]`. Clipping only narrows the interval; the conformal guarantee
+  is unchanged. If the floor is wrong (`y < c` can happen), clipping *breaks* coverage.
+  That is why `auto` checks the data rather than assuming non-negativity.
+- **Order of operations.** Add the conformal margin first, then clip. The point
+  forecast `ŷ` is never modified by this setting.
+- **Clipping is a safety net, not a fix.** A frequently clipped lower bound means a
+  symmetric score fits the error distribution poorly. `score: signed_normalized` learns
+  separate lower and upper quantiles, so the lower side is usually already tight. MMF
+  should report the share of clipped bounds per model in `evaluation_output` as a
+  diagnostic.
+- **Interaction with existing target clipping.** Local pipelines currently force
+  `clip(0)` on the target and on point forecasts (`Forecaster.py:343`,
+  `StatsFcForecastingPipeline.py:37,105,141`). For signed targets, `clip_lower: none`
+  only makes sense once that hard-coded clipping is made configurable too. This is
+  tracked as an open question (§9).
+- An analogous `clip_upper` (e.g. `1.0` for rates and percentages) can be added with
+  the same semantics, without `auto`.
 
 ### 7.4 Output schema changes
 
@@ -504,6 +539,11 @@ infinitely wide intervals always cover.
 6. Interaction with the model selection in skill 5 (best model per series): calibrate
    the *selected* model per series. Selection on the same backtest windows biases the
    calibration slightly toward optimism.
+7. Should the hard-coded `clip(0)` on the target and on point forecasts in the local
+   pipelines become configurable as well (e.g. reuse `clip_lower` or add a
+   `target_clip_lower` setting)? Without that, `clip_lower: none` has no effect on
+   signed targets for local models, because their residuals are computed on clipped
+   data.
 
 ---
 
