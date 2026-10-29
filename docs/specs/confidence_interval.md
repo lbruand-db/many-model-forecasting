@@ -571,16 +571,21 @@ Key naming in the map: quantile levels are formatted with no trailing zeros
 (`"0.1"`, not `"0.10"`). The median `"0.5"` is included only when `method` produces it
 (native/CQR). With conformal, the point forecast stays in `<target>`.
 
-`evaluation_output` also gets per-window interval metrics (§8) when intervals are
-enabled.
+`evaluation_output` also gets a `forecast_quantiles: MAP<STRING, ARRAY<DOUBLE>>`
+column, with the same keys as above, holding the native quantiles of each backtest
+window (null for models without native bands). It also gets interval metric rows
+(§8, §11.4). Both are only written when intervals are enabled.
 
 ### 7.5 Phasing
 
 1. **P0**: Layer B with all three `coverage.target` values (default `series` with
    ABC×XYZ shrinkage), MMF-computed grouping columns (ABC, XYZ, Syntetos–Boylan),
-   interval metrics, and native pass-through plus CQR for statsforecast (`level=` in
-   backtest and forecast). This is model-agnostic and has no training cost.
-2. **P1**: Layer A for foundation models and Prophet, with CQR on their quantiles.
+   interval metrics, and native pass-through plus CQR for **statsforecast and
+   Chronos** (`level=` / `predict_quantiles` in backtest and forecast). Layer B is
+   model-agnostic and has no training cost. See §11 for the plan.
+2. **P1**: Layer A for TimesFM, Moirai and Prophet, through the same CQR path. This is
+   adapter work only: each model returns its quantiles in the `forecast_quantiles`
+   format.
 3. **P2**: NeuralForecast probabilistic losses (`MQLoss`, `DistributionLoss`, NegBin),
    and LightGBM quantile objective.
 4. **P3**: probabilistic hierarchical reconciliation, and online ACI in a monitoring
@@ -1045,18 +1050,38 @@ infinitely wide intervals always cover.
    the cross-series and horizon pooling and shrinkage workarounds in §6.4. The longer
    backtest settings in §6.3 are documented as opt-in.
 
-4. Should calibration live in the evaluation run, in scoring, or as a separate step
-   (`run_calibration`)? Scoring currently does not read `evaluation_output`.
-5. Do we want *joint* trajectory coverage (Bonferroni / CF-RNN) or per-step coverage?
-   Per-step is the proposed default.
-6. Interaction with the model selection in skill 5 (best model per series): calibrate
-   the *selected* model per series. Selection on the same backtest windows biases the
-   calibration slightly toward optimism.
-7. Should the hard-coded `clip(0)` on the target and on point forecasts in the local
-   pipelines become configurable as well (e.g. reuse `clip_lower` or add a
-   `target_clip_lower` setting)? Without that, `clip_lower: none` has no effect on
-   signed targets for local models, because their residuals are computed on clipped
-   data.
+4. ~~Where does calibration live?~~ **Decided: a separate step.**
+   `run_calibration` runs inside `run_forecast` between evaluation and scoring. It
+   reads `evaluation_output` and writes `calibration_output`; scoring joins on that
+   table. It can also be run on its own, to recalibrate without retraining (§11.1).
+5. ~~Joint trajectory coverage or per-step?~~ **Decided: per-step**, as every product
+   does. Joint coverage is out of scope.
+6. ~~Interaction with model selection?~~ **Decided:** calibrate the selected model as
+   it is, and report its coverage. The optimism from selecting on the same windows is
+   small compared with the 1–2 point differences measured. A held-out last window can
+   be added later.
+7. ~~Make the hard-coded `clip(0)` on local models configurable?~~ **Decided: not in
+   P0.** Document that `clip_lower: none` has no effect on statsforecast models,
+   because their target and forecasts are clipped at 0
+   (`StatsFcForecastingPipeline.py:37,105,141`). Making it configurable changes point
+   forecasts and is a separate change.
+8. ~~Where does the backtest store native bands?~~ **Decided:** a new
+   `forecast_quantiles` column in `evaluation_output` (§7.4). It is only filled when
+   intervals are enabled. Existing tables are migrated with `mergeSchema`.
+9. ~~How is the configuration passed?~~ **Decided: both ways.** A
+   `prediction_intervals` block in the YAML config is the default, and a
+   `run_forecast(prediction_intervals={...})` argument overrides it, like the other
+   parameters.
+10. ~~Where do interval metrics go?~~ **Decided:** as new `metric_name` rows in
+    `evaluation_output`, so the existing post-evaluation notebooks pick them up
+    (§11.4).
+11. ~~Where does ABC×XYZ come from?~~ **Decided:** it is computed inside
+    `run_calibration` from the training data (the last 365 days before the first
+    backtest window). It is stored in `calibration_output`, and `group_col: <column>`
+    overrides it with a user column.
+
+*Deferred:* a second dataset (`fresh_retail_net`), recency weighting, `both` for the
+Genie views (Q2), the Moirai sample count, and TimesFM and global models (P1/P2).
 
 ---
 
@@ -1127,3 +1152,105 @@ Library / product docs (accessed 2026-10)
 - mlforecast conformal & transfer intervals (source): https://github.com/Nixtla/mlforecast/blob/main/mlforecast/conformal_prediction.py
 - AutoGluon conformalized local models (source): https://github.com/autogluon/autogluon/blob/master/timeseries/src/autogluon/timeseries/models/local/statsforecast.py
 - Azure `ForecastingPipelineWrapper` (validation-fold `stddev`): https://learn.microsoft.com/en-us/python/api/azureml-training-tabular/azureml.training.tabular.models.forecasting_pipeline_wrapper.forecastingpipelinewrapper
+
+---
+
+## 11. Implementation plan (P0)
+
+This section follows the decisions in §9. P0 covers residual conformal for every model,
+plus native + CQR for statsforecast and Chronos.
+
+### 11.1 Pipeline flow
+
+```
+run_forecast
+ ├─ evaluate_models    backtest as today; when intervals are enabled, models with native
+ │                     bands also write forecast_quantiles per window -> evaluation_output
+ ├─ run_calibration    NEW: reads evaluation_output (this run_id) and the training data
+ │                     1. per-series features: σ (seasonal-naive MAE), ABC, XYZ, SB
+ │                     2. scores: residual (signed, normalised) or CQR (asym, adaptive split)
+ │                     3. pooled quantiles + shrinkage per (model, pool, step, level)
+ │                     4. out-of-sample interval metrics (§11.4) -> evaluation_output rows
+ │                     -> calibration_output
+ └─ score_models       forecast as today, plus native bands where available; joins
+                       calibration_output -> interval columns in scoring_output (§7.4)
+```
+
+`run_calibration` is also public, so that a past run can be recalibrated with other
+settings (levels, `coverage.target`, κ) without retraining: `run_calibration(spark,
+evaluation_output=..., run_id=..., prediction_intervals={...})`. Because scoring needs
+the calibration, a recalibration only applies to scoring runs that happen after it.
+
+`prediction_intervals.enabled` defaults to **`false`** in the shipped
+`forecasting_conf_*.yaml`. Existing pipelines and table schemas are therefore unchanged
+until a user opts in. The `true` shown in §7.3 is the recommended setting.
+
+### 11.2 Files to change
+
+| File | Change |
+|---|---|
+| `mmf_sa/__init__.py` | `run_forecast(prediction_intervals=None)`, merged over the YAML block. Calls `run_calibration` between evaluation and scoring. Exports `run_calibration`. |
+| `mmf_sa/forecasting_conf_{hourly,daily,weekly,monthly}.yaml` | Default `prediction_intervals` block (§7.3) with `enabled: false`. |
+| `mmf_sa/models/models_conf.yaml` | Per-model `native_intervals: true\|false` capability flag. Initially true for the statsforecast models listed in §3.1 and for the Chronos models. |
+| `mmf_sa/models/abstract_model.py` | `backtest` / `calculate_metrics` carry an optional `forecast_quantiles` dict per window. `predict` accepts the quantile levels to produce. |
+| `mmf_sa/models/statsforecast/StatsFcForecastingPipeline.py` | When native intervals are requested, pass `level=` to `predict`, and map `-lo-/-hi-` to quantile keys. Point-forecast clipping is unchanged (§9 Q7). |
+| `mmf_sa/models/chronosforecast/ChronosPipeline.py` | Use `predict_quantiles` in the distributed, single (serverless) and backtest paths, keeping the median as the point forecast. Log a warning when a requested level is outside a Bolt model's trained 0.1–0.9 range (§7.1). |
+| `mmf_sa/Forecaster.py` | Add `forecast_quantiles` to the evaluation UDF schemas and writers. `score_*` writes the native bands and applies `calibration_output`. A `run_calibration` method orchestrates the Spark side. |
+| `mmf_sa/calibration.py` (new) | Pure pandas/numpy: finite-sample ranks, residual scores, CQR scores (`asymmetric` + adaptive split, `scaled`, `symmetric`), group merging, shrinkage, ABC/XYZ/SB features, `clip_lower`, `output_format`, interval metrics. Ported from `docs/specs/experiments/pi_grouping_m5.py`. |
+| `tests/unit/test_calibration.py` (new) | Rank, shrinkage and CQR unit tests, plus a golden test against the notebook's numbers on a small fixed M5 sample. |
+| `README.md`, `mmf_sa/README.md`, `skills/.../4-execute-mmf-forecast.md`, `5-post-process-and-evaluate.md` | Document the parameters, the tables, and the `clip(0)` limitation. Update the outdated "GPU models cannot use serverless" note. |
+
+### 11.3 Tables
+
+`evaluation_output` (new column, nullable):
+`forecast_quantiles MAP<STRING, ARRAY<DOUBLE>>`, with keys as in §7.4.
+
+`calibration_output` (new, appended per `run_id`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `run_id`, `use_case`, `model` | STRING | |
+| `method` | STRING | `conformal` or `cqr` (what `method: auto` resolved to) |
+| `coverage_target`, `pool_key` | STRING | `pool_key` = group label, `__other__`, `__all__`, or a series id for `series` |
+| `<group_id>` | STRING | null unless `coverage_target = series` |
+| `step` | INT | 1..`prediction_length`, or 0 when steps are pooled |
+| `level` | INT | |
+| `q_lo`, `q_hi` | DOUBLE | in units of σ (conformal / CQR `asymmetric`) or of the native half-width (`scaled`) |
+| `n_scores`, `shrinkage_weight`, `infinite_bound` | INT / DOUBLE / BOOLEAN | diagnostics |
+| `sigma`, `abc_class`, `xyz_class`, `sb_class` | DOUBLE / STRING | per series; stored in rows with `step = 0` and `level = 0` |
+
+`scoring_output`: interval columns per `output_format` (§7.4).
+
+### 11.4 Interval metrics
+
+Coverage and MSIS have to be measured on windows that were not used to calibrate.
+`run_calibration` therefore computes them leave-one-window-out: for each backtest
+window, it recalibrates on the other windows with the same settings and scores the
+held-out one. With W=3 that means calibrating on 2 windows, so these metrics are
+slightly pessimistic for the shipped bands. They are written as `evaluation_output`
+rows: `metric_name` ∈ {`coverage_<L>`, `msis_<L>`, `width_<L>`, `wql`}, one row per
+series × window × model, with null `forecast`/`actual`. The native bands, when
+present, are also reported as `native_coverage_<L>` / `native_msis_<L>`.
+
+### 11.5 P0 tasks (one PR each)
+
+1. **Config and plumbing.** Add the `prediction_intervals` block, the `run_forecast`
+   argument, the `native_intervals` flags and a no-op `run_calibration`. With
+   `enabled: false` everything behaves exactly as today (regression test on the
+   existing integration test).
+2. **`calibration.py` core and unit tests.** Port the experiment math. The golden
+   test reproduces the notebook's coverage and MSIS on a fixed 100-series M5 sample
+   within 1e-9.
+3. **Native bands in the backtest.** Write `forecast_quantiles` for statsforecast and
+   Chronos (local UDF and foundation paths), with the `mergeSchema` migration.
+4. **`run_calibration` on Spark.** Features, scores, pooling, `calibration_output`,
+   and the leave-one-window-out metrics.
+5. **Scoring.** Native bands at forecast time, apply the calibration, `clip_lower`,
+   `output_format`.
+6. **Docs and example.** README, skills, and an example notebook on M5 daily that
+   shows coverage per ABC×XYZ class.
+7. **Validation.** An end-to-end MMF run on the 4,966-series M5 sample (seed 7) must
+   reproduce the experiment's coverage within 0.5 point, and its MSIS within 2%, for
+   AutoETS, SeasonalNaive, CrostonSBA and Chronos-Bolt. MMF's backtest windows
+   differ from the notebook's (`backtest_length` / `stride`), so the windows are
+   set to match.
