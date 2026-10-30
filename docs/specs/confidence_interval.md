@@ -573,8 +573,9 @@ Key naming in the map: quantile levels are formatted with no trailing zeros
 
 `evaluation_output` also gets a `forecast_quantiles: MAP<STRING, ARRAY<DOUBLE>>`
 column, with the same keys as above, holding the native quantiles of each backtest
-window (null for models without native bands). It also gets interval metric rows
-(§8, §11.4). Both are only written when intervals are enabled.
+window (null for models without native bands). It is only written when intervals are
+enabled. The interval metrics (§8, §11.4) go to their own table, not to
+`evaluation_output`.
 
 ### 7.5 Phasing
 
@@ -1072,9 +1073,13 @@ infinitely wide intervals always cover.
    `prediction_intervals` block in the YAML config is the default, and a
    `run_forecast(prediction_intervals={...})` argument overrides it, like the other
    parameters.
-10. ~~Where do interval metrics go?~~ **Decided:** as new `metric_name` rows in
-    `evaluation_output`, so the existing post-evaluation notebooks pick them up
-    (§11.4).
+10. ~~Where do interval metrics go?~~ **Decided: a separate table**,
+    `<evaluation_output>_interval_metrics` (`run_forecast(interval_metrics_output=...)`).
+    The first choice was new `metric_name` rows in `evaluation_output`. It was reversed
+    during implementation: the post-evaluation notebook, Skill 5's model selection, the
+    Results Explorer app and users' own queries average `metric_value` per series and
+    model without filtering `metric_name`, and reconciliation explodes the `forecast`
+    arrays. The extra rows would have silently corrupted model selection (§11.4).
 11. ~~Where does ABC×XYZ come from?~~ **Decided:** it is computed inside
     `run_calibration` from the training data (the last 365 days before the first
     backtest window). It is stored in `calibration_output`, and `group_col: <column>`
@@ -1170,7 +1175,7 @@ run_forecast
  │                     1. per-series features: σ (seasonal-naive MAE), ABC, XYZ, SB
  │                     2. scores: residual (signed, normalised) or CQR (asym, adaptive split)
  │                     3. pooled quantiles + shrinkage per (model, pool, step, level)
- │                     4. out-of-sample interval metrics (§11.4) -> evaluation_output rows
+ │                     4. out-of-sample interval metrics (§11.4) -> <evaluation_output>_interval_metrics
  │                     -> calibration_output
  └─ score_models       forecast as today, plus native bands where available; joins
                        calibration_output -> interval columns in scoring_output (§7.4)
@@ -1231,9 +1236,11 @@ Coverage and MSIS have to be measured on windows that were not used to calibrate
 `run_calibration` therefore computes them leave-one-window-out: for each backtest
 window, it recalibrates on the other windows with the same settings and scores the
 held-out one. With W=3 that means calibrating on 2 windows, so these metrics are
-slightly pessimistic for the shipped bands. They are written as `evaluation_output`
-rows: `metric_name` ∈ {`coverage_<L>`, `msis_<L>`, `width_<L>`}, one row per
-series × window × model, with null `forecast`/`actual`. The native bands, when
+slightly pessimistic for the shipped bands. They are written to
+`<evaluation_output>_interval_metrics` (columns `<group_id>`,
+`backtest_window_start_date`, `metric_name`, `metric_value`, `model`, `run_id`,
+`run_date`, `use_case`), with `metric_name` ∈ {`coverage_<L>`, `msis_<L>`, `width_<L>`},
+one row per series × window × model. The native bands, when
 present, are also reported as `native_coverage_<L>` / `native_msis_<L>` /
 `native_width_<L>`. A weighted quantile loss (`wql`) is deferred.
 
