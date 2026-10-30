@@ -1205,19 +1205,23 @@ until a user opts in. The `true` shown in §7.3 is the recommended setting.
 `evaluation_output` (new column, nullable):
 `forecast_quantiles MAP<STRING, ARRAY<DOUBLE>>`, with keys as in §7.4.
 
-`calibration_output` (new, appended per `run_id`):
+`calibration_output` (new, appended per `run_id`). As implemented in step 4, it has one
+row per model × series × horizon step × level, whatever the coverage target. The
+per-series features are repeated on every row, so scoring joins on the series id alone:
 
 | Column | Type | Notes |
 |---|---|---|
-| `run_id`, `use_case`, `model` | STRING | |
-| `method` | STRING | `conformal` or `cqr` (what `method: auto` resolved to) |
-| `coverage_target`, `pool_key` | STRING | `pool_key` = group label, `__other__`, `__all__`, or a series id for `series` |
-| `<group_id>` | STRING | null unless `coverage_target = series` |
-| `step` | INT | 1..`prediction_length`, or 0 when steps are pooled |
-| `level` | INT | |
-| `q_lo`, `q_hi` | DOUBLE | in units of σ (conformal / CQR `asymmetric`) or of the native half-width (`scaled`) |
-| `n_scores`, `shrinkage_weight`, `infinite_bound` | INT / DOUBLE / BOOLEAN | diagnostics |
-| `sigma`, `abc_class`, `xyz_class`, `sb_class` | DOUBLE / STRING | per series; stored in rows with `step = 0` and `level = 0` |
+| `run_id`, `run_date`, `use_case`, `model` | STRING / TIMESTAMP | |
+| `method` | STRING | `conformal`, `cqr` or `native` (what `method: auto` resolved to) |
+| `score` | STRING | `signed_normalized` / `signed` (conformal), `asymmetric` / `symmetric` / `scaled` (CQR), `native` |
+| `coverage_target` | STRING | `marginal` / `group` / `series` (conformal), the `cqr_pool` (CQR), `native` |
+| `<group_id>`, `pool_key` | STRING | series id; `pool_key` = its (merged) group label, `__other__` or `__all__` |
+| `step` | INT | 1..`prediction_length` |
+| `level` | DOUBLE | central level in percent |
+| `q_lo`, `q_hi` | DOUBLE | in units of σ (conformal `signed_normalized`, CQR `asymmetric` / `symmetric`), of 1 (`signed`), or of the native half-width (`scaled`) |
+| `n_windows`, `shrinkage_weight`, `infinite_bound` | INT / DOUBLE / BOOLEAN | diagnostics |
+| `clip_lower` | DOUBLE | resolved `clip_lower`, null for no clipping |
+| `sigma`, `abc_class`, `xyz_class`, `sb_class` | DOUBLE / STRING | per-series scale and classes |
 
 `scoring_output`: interval columns per `output_format` (§7.4).
 
@@ -1228,9 +1232,10 @@ Coverage and MSIS have to be measured on windows that were not used to calibrate
 window, it recalibrates on the other windows with the same settings and scores the
 held-out one. With W=3 that means calibrating on 2 windows, so these metrics are
 slightly pessimistic for the shipped bands. They are written as `evaluation_output`
-rows: `metric_name` ∈ {`coverage_<L>`, `msis_<L>`, `width_<L>`, `wql`}, one row per
+rows: `metric_name` ∈ {`coverage_<L>`, `msis_<L>`, `width_<L>`}, one row per
 series × window × model, with null `forecast`/`actual`. The native bands, when
-present, are also reported as `native_coverage_<L>` / `native_msis_<L>`.
+present, are also reported as `native_coverage_<L>` / `native_msis_<L>` /
+`native_width_<L>`. A weighted quantile loss (`wql`) is deferred.
 
 ### 11.5 P0 tasks (one PR each)
 
@@ -1239,18 +1244,82 @@ present, are also reported as `native_coverage_<L>` / `native_msis_<L>`.
    `enabled: false` everything behaves exactly as today (regression test on the
    existing integration test).
 2. **`calibration.py` core and unit tests.** Port the experiment math. The golden
-   test reproduces the notebook's coverage and MSIS on a fixed 100-series M5 sample
+   test reproduces the notebook's coverage and MSIS on a fixed 30-series M5 sample
    within 1e-9.
 3. **Native bands in the backtest.** Write `forecast_quantiles` for statsforecast and
    Chronos (local UDF and foundation paths), with the `mergeSchema` migration.
 4. **`run_calibration` on Spark.** Features, scores, pooling, `calibration_output`,
-   and the leave-one-window-out metrics.
+   and the leave-one-window-out metrics. The first version pools on the driver.
+   4b. **Distributed calibration** (§11.6). Same results without collecting the
+   backtest to the driver.
 5. **Scoring.** Native bands at forecast time, apply the calibration, `clip_lower`,
-   `output_format`.
+   `output_format`. The calibration is joined to the forecasts and applied per
+   partition (§11.6).
 6. **Docs and example.** README, skills, and an example notebook on M5 daily that
    shows coverage per ABC×XYZ class.
 7. **Validation.** An end-to-end MMF run on the 4,966-series M5 sample (seed 7) must
    reproduce the experiment's coverage within 0.5 point, and its MSIS within 2%, for
    AutoETS, SeasonalNaive, CrostonSBA and Chronos-Bolt. MMF's backtest windows
    differ from the notebook's (`backtest_length` / `stride`), so the windows are
-   set to match.
+   set to match. A second run on about 1M synthetic series, with the driver memory
+   capped, checks that nothing scales with the number of series on the driver.
+
+### 11.6 Scaling to millions of series
+
+For 1M series, W = 3, H = 28 and 5 quantiles, the backtest of one model is about
+600M doubles (≈ 5 GB), and its scoring rows about 170M doubles. Neither may be
+collected to the driver. What is left on the driver must not grow with the number of
+series: pool tables (groups × steps × levels), group-label maps and scalars.
+
+**Scoring (done in step 5).** The corrections are pivoted in Spark to one row per
+series (`q_lo` / `q_hi` arrays ordered by step, σ, method, score, per level). They are
+left-joined to the forecasts and applied per partition with `mapInPandas`, by the same
+pure code as the reference `apply_calibration`. Only the fallback for series without
+calibration (the per-step median correction, an exact `percentile` per level and
+step) is collected.
+
+**Calibration (task 4b).** The math splits into pooled statistics and a per-series
+combination, and each has a distributed form:
+
+1. **Long scores.** Per model, `posexplode` the `forecast` / `actual` arrays (and the
+   native quantiles) into rows (series, window, step, y, ŷ, lo, hi). The window index
+   is the rank of the window among the series' last W windows. Join the per-series σ
+   and pool label, and compute the scores: `(y − ŷ)/σ` for conformal, and `(lo − y)/σ`
+   / `(y − hi)/σ` (or the symmetric or scaled score) for CQR.
+2. **Group merging.** Count series per label in Spark, and map labels below
+   `min_scores_per_group` to `__other__`. The map has one entry per label.
+3. **Pool quantiles, exactly.** The conformal quantile is an order statistic: rank
+   `k = ⌈(n+1)q⌉` (or `⌊(n+1)q⌋` for the lower tail), clipped to [1, n]. It is computed
+   in SQL from the pool's count, with the same float rounding guard as
+   `conformal_rank`. `row_number()` over (pool, step) ordered by score, filtered to
+   `rn = k`, gives exactly the numpy value: ties do not change the k-th value. The
+   steps-pooled quantile `q_all` per pool is the same with the partition on the pool
+   only. The result is small (pools × steps).
+4. **Per-series combination.** `applyInPandas` by series, over its W×H scores. It
+   computes the per-series quantiles with `calibration.tail_quantiles` /
+   `upper_quantile`, combines them with the broadcast pool table (shrinkage with
+   λ = W/(W+κ), and the step profile), and emits the series' `calibration_output` rows.
+   Targets without a per-series part (marginal, group, the CQR group pool) just join
+   the pool table.
+5. **CQR adaptive split.** `m_lo` = the mean, over all scores, of `s_lo > q_lo(pool,
+   step)`: one join and one `avg`. Then the upper-tail quantiles are computed at
+   `1 − α + m_lo` (capped at `1 − α/2`), with step 3 again.
+6. **Leave-one-window-out metrics.** Duplicate the long scores with a `fold` column
+   (fold j drops window j), add `fold` to every partition key in steps 3–5, and score
+   window j per series in the step-4 UDF. That is W times the data in one pass, rather
+   than W passes.
+7. **Classes without the driver.** ABC uses the cumulative volume share (a window
+   ordered by volume descending, then by series id). XYZ uses the rank `r` of CV
+   (ordered by CV, then series id): X when `r ≤ 1 + (N−1)/3`, Y when
+   `r ≤ 1 + 2(N−1)/3`, otherwise Z. This matches `pd.qcut` on `rank(method="first")`
+   exactly.
+
+The numpy functions stay as the reference. The golden and randomized tests compare
+the Spark path against `calibrate_model` to 1e-12, on the M5 fixture and on random
+cubes with ties, small groups and infinite ranks. They run locally on PySpark ≥ 3.5
+with Python ≤ 3.11, because OSS PySpark 3.4 cannot run its Python workers on
+Python 3.12, nor return `array<timestamp>` from `applyInPandas`.
+
+Cost: per model and level, the sort in step 3 covers N×W×H rows per fold, so about
+250M rows for 1M series at W = 3 (× 3 folds). That is minutes on a mid-size cluster,
+and much less than the backtest itself, which refits every local model W times.
