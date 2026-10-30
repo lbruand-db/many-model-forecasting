@@ -1271,6 +1271,40 @@ present, are also reported as `native_coverage_<L>` / `native_msis_<L>` /
    set to match. A second run on about 1M synthetic series, with the driver memory
    capped, checks that nothing scales with the number of series on the driver.
 
+**Task 7 outcome** (notebooks and results in `tests/validation/` on the feature branch,
+run on serverless with the default environment):
+
+- The 0.5-point / 2% criterion above assumed MMF could replay the experiment, which
+  calibrates once and scores 4 later windows with refits. MMF calibrates and forecasts in
+  one run, so the M5 check scores the 28 days after the experiment's test cutoff instead,
+  with the experiment's last 3 calibration windows as MMF's backtest.
+- **Held-out coverage on 4,966 M5 series** (MMF / experiment):
+
+  | Model | 80% | 95% |
+  |---|---:|---:|
+  | AutoETS (CQR) | 0.794 / 0.788 | 0.943 / 0.944 |
+  | SeasonalNaive (CQR) | 0.808 / 0.799 | 0.947 / 0.946 |
+  | CrostonSBA (conformal) | 0.790 / 0.783 | 0.948 / 0.944 |
+
+  Coverage is within 1 point of the experiment. MSIS is 7–37% higher, which is not
+  comparable: 1 held-out window instead of 4, and σ measured on a different year.
+- **Spark equals the numpy reference** on MMF's own backtest: the maximum difference of
+  the corrections, coverage and MSIS is 0 for every model and level.
+- **Scale** (synthetic backtests, h = 7, 3 windows, 2 models):
+
+  | Series | Calibration | Scoring per model |
+  |---:|---:|---:|
+  | 100k | 4.1 min | ~35 s |
+  | 1M | 13.1 min | 2–3 min |
+
+  All row counts were as expected, with no null intervals. Getting there required batching
+  the per-series work into hash buckets of ~2,000 series per UDF call, computing the
+  features in SQL, and materializing intermediate results to temporary tables where
+  `persist()` is unavailable (serverless clients before environment version 5). The first
+  version took 61 min at 100k.
+- The local-model backtest itself, one statsforecast fit per series and window, remains the
+  bottleneck of an end-to-end run at that scale. It is outside the prediction-interval code.
+
 ### 11.6 Scaling to millions of series
 
 For 1M series, W = 3, H = 28 and 5 quantiles, the backtest of one model is about
